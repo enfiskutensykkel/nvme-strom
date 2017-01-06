@@ -2207,4 +2207,4 @@ module_exit(nvme_strom_exit);
 MODULE_AUTHOR("KaiGai Kohei <kaigai@kaigai.gr.jp>");
 MODULE_DESCRIPTION("SSD-to-GPU Direct Stream Module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.5");

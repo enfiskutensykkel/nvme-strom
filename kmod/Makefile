@@ -35,13 +35,15 @@ default: modules nvme_test
 nvme_test: nvme_test.c nvme_strom.h
 	$(CC) -Wall nvme_test.c -o $@ $(USERSPACE_FLAGS) -lcuda -lpthread
 
+# TODO:
+# Run 'dkms install $(NVME_STROM_PKGNAME)/$(NVME_STROM_VERSION)' here.
+# However, dkms command raises an error if old version is already
+# installed. So, we use manual operations instead.
+#
 install-dkms:
 	mkdir -p $(DKMS_DEST)
 	install -m 0644 dkms.conf Makefile $(KMOD_SOURCE) $(DKMS_DEST)
-	# TODO:
-	# Run 'dkms install $(NVME_STROM_PKGNAME)/$(NVME_STROM_VERSION)' here.
-	# However, dkms command raises an error if old version is already
-	# installed. So, we use manual operations instead.
+	install -m 0644 nvme_strom.modprobe.conf /etc/modprobe.d
 
 clean:
 	rm -f $(EXTRA_CLEAN)
