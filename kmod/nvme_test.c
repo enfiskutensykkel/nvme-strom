@@ -359,7 +359,7 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		uarg.file_desc	= fdesc;
 		uarg.nr_chunks	= nchunks;
 		uarg.chunk_sz	= BLCKSZ;
-		uarg.relseg_sz	= RELSEG_SIZE;
+		uarg.relseg_sz	= 0;
 		uarg.chunk_ids	= atask->block_nums;
 		uarg.wb_buffer	= atask->src_buffer;
 

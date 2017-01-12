@@ -1201,7 +1201,7 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
 /*
  * write back a chunk to user buffer
  */
-static inline int
+static int
 __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 						   int nr_pages,
 						   loff_t fpos,
@@ -1276,7 +1276,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 /*
  * Submit a P2P DMA request
  */
-static inline int
+static int
 __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 							int nr_pages,
 							loff_t fpos,
@@ -1296,7 +1296,7 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 		 i++, j++, fpos += PAGE_CACHE_SIZE)
 	{
 		fpage = dtask->file_pages[j];
-		Assert(!PageDirty(fpage));
+		Assert(!fpage || !PageDirty(fpage));
 
 		/* lookup the source block number */
 		memset(&bh, 0, sizeof(bh));
@@ -1386,8 +1386,6 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 	struct file	   *filp = dtask->filp;
 	char __user	   *dest_uaddr;
 	size_t			dest_offset;
-	unsigned int	nr_ram2gpu = 0;
-	unsigned int	nr_ssd2gpu = 0;
 	unsigned int	nr_pages = (karg->chunk_sz >> PAGE_CACHE_SHIFT);
 	int				threshold = nr_pages / 2;
 	size_t			i_size;
@@ -1407,14 +1405,16 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 	i_size = i_size_read(filp->f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
 	{
-		uint32_t		chunk_id = (karg->relseg_sz == 0
-									? chunk_ids_in[i]
-									: chunk_ids_in[i] % karg->relseg_sz);
-		loff_t			fpos = chunk_id * karg->chunk_sz;
+		uint32_t		chunk_id = chunk_ids_in[i];
+		loff_t			fpos;
 		struct page	   *fpage;
 		int				score = 0;
 
-		Assert((fpos & (PAGE_CACHE_SIZE - 1)) != 0);
+		if (karg->relseg_sz == 0)
+			fpos = chunk_id * karg->chunk_sz;
+		else
+			fpos = (chunk_id % karg->relseg_sz) * karg->chunk_sz;
+		Assert((fpos & (PAGE_CACHE_SIZE - 1)) == 0);
 		if (fpos > i_size)
 			return -ERANGE;
 
@@ -1431,18 +1431,17 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 		if (score > threshold)
 		{
 			/*
-			 * Write-back of file pages if majority of the chunk is cached
-			 * on memory, then application will kick MemCpyHtoD for RAM2GPU
-			 * DMA.
+			 * Write-back of file pages if majority of the chunk is cached,
+			 * then application shall call cuMemcpyHtoD for RAM2GPU DMA.
 			 */
-			nr_ram2gpu++;
-			dest_uaddr = (karg->wb_buffer +
-						  karg->chunk_sz * (karg->nr_chunks - nr_ram2gpu));
+			karg->nr_ram2gpu++;
+			dest_uaddr = karg->wb_buffer +
+				karg->chunk_sz * (karg->nr_chunks - karg->nr_ram2gpu);
 			retval = __memcpy_ssd2gpu_writeback(dtask,
 												nr_pages,
 												fpos,
 												dest_uaddr);
-			chunk_ids_out[karg->nr_chunks - nr_ram2gpu] = chunk_id;
+			chunk_ids_out[karg->nr_chunks - karg->nr_ram2gpu] = chunk_id;
 		}
 		else
 		{
@@ -1452,9 +1451,9 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 												 dest_offset,
 												 &karg->nr_dma_submit,
 												 &karg->nr_dma_blocks);
-			chunk_ids_out[nr_ssd2gpu] = chunk_id;
+			chunk_ids_out[karg->nr_ssd2gpu] = chunk_id;
 			dest_offset += karg->chunk_sz;
-			nr_ssd2gpu++;
+			karg->nr_ssd2gpu++;
 		}
 	}
 	/* submit pending SSD2GPU DMA request, if any */
