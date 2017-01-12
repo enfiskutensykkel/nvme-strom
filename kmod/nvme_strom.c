@@ -1205,6 +1205,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 	struct file	   *filp = dtask->filp;
 	struct page	   *fpage;
 	char		   *kaddr;
+	pgoff_t			fp_index = fpos >> PAGE_CACHE_SHIFT;
 	loff_t			left;
 	int				i, retval = 0;
 
@@ -1214,9 +1215,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 		/* Synchronous read, if not cached */
 		if (!fpage)
 		{
-			fpage = read_mapping_page(filp->f_mapping,
-									  (fpos >> PAGE_CACHE_SHIFT) + i,
-									  NULL);
+			fpage = read_mapping_page(filp->f_mapping, fp_index + i, NULL);
 			if (IS_ERR(fpage))
 			{
 				retval = PTR_ERR(fpage);
@@ -1271,7 +1270,7 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 	struct buffer_head	bh;
 	unsigned int		nr_blocks;
 	loff_t				curr_offset = dest_offset;
-	int					i, j, retval = 0;
+	int					i, retval = 0;
 
 	for (i=0; i < nr_pages; i++, fpos += PAGE_CACHE_SIZE)
 	{
@@ -1315,7 +1314,6 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			dtask->dest_offset = curr_offset;
 			dtask->src_block = bh.b_blocknr;
 			dtask->nr_blocks = nr_blocks;
-			j = 0;
 		}
 		curr_offset += PAGE_CACHE_SIZE;
 	}
@@ -1339,7 +1337,7 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 	int				threshold = nr_pages / 2;
 	size_t			i_size;
 	int				retval = 0;
-	int				i, j;
+	int				i, j, k;
 
 	/* sanity checks */
 	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
@@ -1367,10 +1365,9 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 		if (fpos > i_size)
 			return -ERANGE;
 
-		for (j=0; j < nr_pages; j++, fpos += PAGE_CACHE_SIZE)
+		for (j=0, k=fpos >> PAGE_CACHE_SHIFT; j < nr_pages; j++, k++)
 		{
-			fpage = find_lock_page(filp->f_mapping,
-								   fpos >> PAGE_CACHE_SHIFT);
+			fpage = find_lock_page(filp->f_mapping, k);
 			dtask->file_pages[j] = fpage;
 			if (fpage)
 				score += (PageDirty(fpage) ? threshold + 1 : 1);

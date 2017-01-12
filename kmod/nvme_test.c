@@ -188,6 +188,8 @@ callback_release_atask(CUstream cuda_stream, CUresult status, void *private)
 					   atask->flen, atask->fpos);
 		system_exit_on_error(nbytes < 0, "pread");
 
+        printf("pread(fdesc=%d,src_buf=%p,len=%zu,fpos=%lu)\n",
+			   atask->fdesc, atask->src_buffer,atask->flen, atask->fpos);
 		for (i=0; i * BLCKSZ < nbytes; i++)
 		{
 			j = atask->block_nums[i];
