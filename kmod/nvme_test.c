@@ -33,6 +33,7 @@
 #define Max(a,b)				((a) > (b) ? (a) : (b))
 #define Min(a,b)				((a) < (b) ? (a) : (b))
 #define BLCKSZ					(8192)
+#define RELSEG_SIZE				(131072)
 
 /* command line options */
 static int		device_index = -1;
@@ -304,7 +305,7 @@ static void
 exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 				   const char *filename, int fdesc, size_t file_size)
 {
-	StromCmd__MemCpySsdToGpuWriteBack *uarg;
+	StromCmd__MemCpySsdToGpuWriteBack uarg;
 	async_task	   *async_tasks;
 	CUresult		rc;
 	int				i, j, rv;
@@ -316,10 +317,6 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 	long			nr_ssd2gpu = 0;
 	long			nr_dma_submit = 0;
 	long			nr_dma_blocks = 0;
-
-	uarg = malloc(offsetof(StromCmd__MemCpySsdToGpuWriteBack,
-						   file_pos[chunk_size / BLCKSZ]));
-	system_exit_on_error(!uarg, "out of memory");
 
 	async_tasks = setup_async_tasks(fdesc);
 	gettimeofday(&tv1, NULL);
@@ -356,36 +353,35 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		pthread_mutex_unlock(&buffer_lock);
 
 		/* setup SSD-to-GPU DMA request */
-		memset(uarg, 0, sizeof(StromCmd__MemCpySsdToGpuWriteBack));
-		uarg->handle		= handle;
-		uarg->offset		= atask->index * chunk_size;
-		uarg->block_size	= BLCKSZ;
-		uarg->block_nums	= atask->block_nums;
-		uarg->block_data	= atask->src_buffer;
-		uarg->file_desc		= fdesc;
-		uarg->nchunks		= nchunks;
-		for (i=0; i < nchunks; i++)
-		{
-			atask->block_nums[i] = i;
-			uarg->file_pos[i] = offset + i * BLCKSZ;
-		}
+		memset(&uarg, 0, sizeof(StromCmd__MemCpySsdToGpuWriteBack));
+		uarg.handle		= handle;
+		uarg.offset		= atask->index * chunk_size;
+		uarg.file_desc	= fdesc;
+		uarg.nr_chunks	= nchunks;
+		uarg.chunk_sz	= BLCKSZ;
+		uarg.relseg_sz	= RELSEG_SIZE;
+		uarg.chunk_ids	= atask->block_nums;
+		uarg.wb_buffer	= atask->src_buffer;
 
-		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK, uarg);
+		for (i=0; i < nchunks; i++)
+			uarg.chunk_ids[i] = offset / BLCKSZ + i;
+
+		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK, &uarg);
 		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK");
-		atask->dma_task_id    = uarg->dma_task_id;
+		atask->dma_task_id    = uarg.dma_task_id;
 		atask->fpos           = offset;
-		nr_ram2gpu += uarg->nr_ram2gpu;
-		nr_ssd2gpu += uarg->nr_ssd2gpu;
-		nr_dma_submit += uarg->nr_dma_submit;
-		nr_dma_blocks += uarg->nr_dma_blocks;
+		nr_ram2gpu += uarg.nr_ram2gpu;
+		nr_ssd2gpu += uarg.nr_ssd2gpu;
+		nr_dma_submit += uarg.nr_dma_submit;
+		nr_dma_blocks += uarg.nr_dma_blocks;
 
 		/* kick RAM-to-GPU DMA, if written back */
-		if (uarg->nr_ram2gpu > 0)
+		if (uarg.nr_ram2gpu > 0)
 		{
 			rc = cuMemcpyHtoDAsync(cuda_devptr + atask->index * chunk_size,
 								   (char *)atask->src_buffer +
-								   BLCKSZ * (nchunks - uarg->nr_ram2gpu),
-								   BLCKSZ * uarg->nr_ram2gpu,
+								   BLCKSZ * (nchunks - uarg.nr_ram2gpu),
+								   BLCKSZ * uarg.nr_ram2gpu,
 								   atask->cuda_stream);
 			cuda_exit_on_error(rc, "cuMemcpyHtoDAsync");
 		}

@@ -761,12 +761,8 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
  * length of DMA request.
  */
 #define STROM_DMA_SSD2GPU_MAXLEN		(128 * 1024)
-
-/*
- * Number of pages to be enqueued to a workqueue for asynchronous RAM2GPU
- * memcpy. Too small request will increase the task switch overhead.
- */
-#define STROM_RAM2GPU_MAXPAGES		(2048 * 1024 / PAGE_SIZE)	/* 2MB */
+#define STROM_DMA_MAX_NR_FPAGES		\
+	(2 * STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE)
 
 struct strom_dma_task
 {
@@ -783,6 +779,7 @@ struct strom_dma_task
 	int					blocksz_shift;	/* log2 of 'blocksz' */
 	sector_t			start_sect;	/* first sector of the source partition */
 	sector_t			nr_sects;	/* number of sectors of the partition */
+	unsigned int		max_nblocks;/* upper limit of @nr_blocks */
 
 	/*
 	 * status of asynchronous tasks
@@ -802,37 +799,15 @@ struct strom_dma_task
 	long				dma_status;
 	struct file		   *ioctl_filp;
 
-	/* current virtual address mapping of GPU page */
-	char			   *dest_iomap;	/* current ioremap_wc() window */
-	unsigned int		dest_index;	/* index of the GPU memory page */
-
-	/* contiguous SSD blocks */
+	/* state of the current pending SSD2GPU DMA request */
 	loff_t				dest_offset;/* current destination offset */
 	sector_t			src_block;	/* head of the source blocks */
 	unsigned int		nr_blocks;	/* # of the contigunous source blocks */
-	unsigned int		max_nblocks;/* upper limit of @nr_blocks */
-	/* contiguous Page caches */
-	size_t				page_ofs;	/* offset from the first page */
-	size_t				copy_len;	/* "total" length to copy */
+
 	unsigned int		nr_fpages;	/* number of the pending pages */
-	struct page		   *file_pages[STROM_RAM2GPU_MAXPAGES];
+	struct page		   *file_pages[STROM_DMA_MAX_NR_FPAGES];
 };
 typedef struct strom_dma_task	strom_dma_task;
-
-/*
- * strom_memcpy_task - request of RAM2GPU asynchronous memcpy
- */
-struct strom_memcpy_task
-{
-	struct work_struct work;
-	strom_dma_task *dtask;
-	size_t			offset;		/* destination offset of the request */
-	size_t			copy_len;	/* total length to copy */
-	size_t			page_ofs;	/* offset of the first page */
-	unsigned int	nr_fpages;	/* number of pending pages */
-	struct page	   *file_pages[1];	/* variable length */
-};
-typedef struct strom_memcpy_task	strom_memcpy_task;
 
 #define STROM_DMA_TASK_NSLOTS		240
 static spinlock_t		strom_dma_task_locks[STROM_DMA_TASK_NSLOTS];
@@ -910,15 +885,13 @@ strom_create_dma_task(unsigned long handle,
 	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
 	dtask->start_sect	= s_bdev->bd_part->start_sect;
 	dtask->nr_sects		= s_bdev->bd_part->nr_sects;
+	dtask->max_nblocks = STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift;
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
 
 	dtask->dest_offset	= 0;
 	dtask->src_block	= 0;
 	dtask->nr_blocks	= 0;
-	dtask->max_nblocks = STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift;
-	dtask->page_ofs		= 0;
-	dtask->copy_len		= 0;
 	dtask->nr_fpages	= 0;
 
     /* OK, this strom_dma_task is now tracked */
@@ -1008,121 +981,6 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 	}
 	else if (has_spinlock)
 		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
-}
-
-/*
- * submit_ram2gpu_memcpy - asynchronous RAM2GPU copy by CPU workqueue
- */
-static void
-callback_ram2gpu_memcpy(struct work_struct *work)
-{
-	strom_memcpy_task  *mc_task = (strom_memcpy_task *) work;
-	strom_dma_task	   *dtask = mc_task->dtask;
-	mapped_gpu_memory  *mgmem = dtask->mgmem;
-	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-	size_t		dest_offset = mc_task->offset;
-	char	   *dest_iomap = NULL;
-	int			dest_index = -1;
-	size_t		cur = mc_task->page_ofs;
-	size_t		end = mc_task->page_ofs + mc_task->copy_len;
-	int			i, j;
-	long		status = 0;
-
-	Assert((mc_task->page_ofs +
-			mc_task->copy_len +
-			PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT == mc_task->nr_fpages);
-
-	while (cur < end)
-	{
-		struct page	   *fpage = mc_task->file_pages[cur >> PAGE_CACHE_SHIFT];
-		size_t			page_ofs = (cur & (PAGE_CACHE_SIZE - 1));
-		size_t			page_len;
-		uint64_t		phy_addr;
-		char		   *saddr;
-		char		   *daddr;
-
-		/* length to copy from this page */
-		page_len = Min(PAGE_CACHE_SIZE, end - (cur & PAGE_MASK)) - page_ofs;
-
-		/* map destination GPU page using write-combined mode */
-		j = dest_offset >> mgmem->gpu_page_shift;
-		if (!dest_iomap || j != dest_index)
-		{
-			if (dest_iomap)
-				iounmap(dest_iomap);
-			phy_addr = page_table->pages[j]->physical_address;
-			dest_iomap = ioremap_wc(phy_addr, mgmem->gpu_page_sz);
-			if (!dest_iomap)
-			{
-				status = -ENOMEM;
-				break;
-			}
-			dest_index = j;
-		}
-		/* choose shorter page_len if it comes across GPU page boundary */
-		if (j != ((dest_offset + page_len) >> mgmem->gpu_page_shift))
-		{
-			page_len = (mgmem->gpu_page_sz -
-						(dest_offset & (mgmem->gpu_page_sz - 1)));
-		}
-		/* do copy by CPU */
-		daddr = dest_iomap + (dest_offset & (mgmem->gpu_page_sz - 1));
-		saddr = kmap_atomic(fpage);
-
-		memcpy_toio(daddr, saddr + page_ofs, page_len);
-		kunmap_atomic(saddr);
-
-		cur += page_len;
-		dest_offset += page_len;
-	}
-	Assert(cur == end || status != 0);
-	/* release resources */
-	for (i=0; i < mc_task->nr_fpages; i++)
-	{
-		unlock_page(mc_task->file_pages[i]);
-		page_cache_release(mc_task->file_pages[i]);
-	}
-	if (dest_iomap)
-		iounmap(dest_iomap);
-
-	strom_put_dma_task(dtask, status);
-	kfree(mc_task);
-}
-
-static int
-submit_ram2gpu_memcpy(strom_dma_task *dtask)
-{
-	strom_memcpy_task  *mc_task;
-	int		i;
-
-	mc_task = kmalloc(offsetof(strom_memcpy_task,
-							   file_pages[dtask->nr_fpages]),
-					  GFP_KERNEL);
-	if (!mc_task)
-	{
-		for (i=0; i < dtask->nr_fpages; i++)
-		{
-			struct page	   *fpage = dtask->file_pages[i];
-
-			unlock_page(fpage);
-			page_cache_release(fpage);
-		}
-		return -ENOMEM;
-	}
-
-	INIT_WORK(&mc_task->work, callback_ram2gpu_memcpy);
-	mc_task->dtask		= strom_get_dma_task(dtask);
-	mc_task->offset		= dtask->dest_offset;
-	mc_task->copy_len	= dtask->copy_len;
-	mc_task->page_ofs	= dtask->page_ofs;
-	mc_task->nr_fpages	= dtask->nr_fpages;
-	memcpy(mc_task->file_pages, dtask->file_pages,
-		   sizeof(struct page *) * dtask->nr_fpages);
-	schedule_work(&mc_task->work);
-
-	dtask->nr_fpages	= 0;	/* reset */
-
-	return 0;
 }
 
 /*
@@ -1234,11 +1092,6 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	if (retval)
 		__nvme_free_iod(nvme_dev, iod);
 
-	/* clear the state */
-	dtask->nr_blocks = 0;
-	dtask->src_block = 0;
-	dtask->dest_offset = ~0UL;
-
 	return retval;
 }
 
@@ -1323,277 +1176,6 @@ out:
 }
 
 /*
- * do_ssd2gpu_async_memcpy - kicker of asyncronous DMA requests
- */
-static long
-do_ssd2gpu_async_memcpy(strom_dma_task *dtask,
-						int nchunks, strom_dma_chunk *dchunks)
-{
-	mapped_gpu_memory  *mgmem = dtask->mgmem;
-	struct file		   *filp = dtask->filp;
-	struct page		   *fpage;
-	long				retval;
-	size_t				i_size;
-	unsigned int		i;
-
-	i_size = i_size_read(filp->f_inode);
-	for (i=0; i < nchunks; i++)
-	{
-		strom_dma_chunk *dchunk = &dchunks[i];
-		loff_t		pos;
-		loff_t		end;
-		size_t		curr_offset;
-
-		if (dchunk->length == 0)
-			continue;
-
-		pos = dchunk->fpos;
-		end = pos + dchunk->length;
-		curr_offset = dchunk->offset + mgmem->map_offset;
-
-		/* range checks */
-		if (pos > i_size ||
-			end > i_size ||
-			curr_offset + dchunk->length > mgmem->map_length)
-			return -ERANGE;
-
-		/*
-		 * Submit if pending SSD2GPU DMA request is not merginable with
-		 * the next chunk.
-		 */
-		if (dtask->nr_blocks > 0 &&
-			curr_offset != (dtask->dest_offset +
-							dtask->nr_blocks * dtask->blocksz))
-		{
-			retval = submit_ssd2gpu_memcpy(dtask);
-			if (retval)
-			{
-				prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
-				return retval;
-			}
-			Assert(dtask->nr_blocks == 0);
-		}
-
-		/*
-		 * alignment checks
-		 */
-		if ((curr_offset & (sizeof(int) - 1)) != 0 ||
-			(pos & (dtask->blocksz - 1)) != 0 ||
-			(end & (dtask->blocksz - 1)) != 0)
-		{
-			prError("alignment violation pos=%zu end=%zu --> dest=%zu",
-					(size_t)pos, (size_t)end, (size_t)curr_offset);
-			return -EINVAL;
-		}
-
-		while (pos < end)
-		{
-			size_t		page_ofs = (pos & (PAGE_CACHE_SIZE - 1));
-			size_t		page_len;
-
-			if (end - pos <= PAGE_CACHE_SIZE)
-				page_len = end - pos;
-			else
-				page_len = PAGE_CACHE_SIZE - page_ofs;
-
-			Assert((page_ofs & (dtask->blocksz - 1)) == 0 &&
-				   (page_len & (dtask->blocksz - 1)) == 0);
-
-			/*
-			 * NOTE: Theoretical performance of RAM-to-GPU transfer should
-			 * be faster than SSD-to-GPU, however, we cannot use DMA engine
-			 * of GPU device, thus, we have to map PCI BAR region with
-			 * ioremap() then copy values by CPU.
-			 * It tends to use unreasonably small packet even if SSE/AVX
-			 * registers are used.
-			 * So, as a workaround, RAM-to-GPU transfer shall be applied
-			 * only when the cached page is dirty.
-			 */
-			fpage = find_lock_page(filp->f_mapping, pos >> PAGE_CACHE_SHIFT);
-			if (fpage)
-			{
-				/* Submit SSD2GPU DMA, if any pending request */
-				if (dtask->nr_blocks > 0)
-				{
-					retval = submit_ssd2gpu_memcpy(dtask);
-					if (retval)
-					{
-						prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
-						return retval;
-					}
-					Assert(dtask->nr_blocks == 0);
-				}
-
-				/* merge pending memcpy if possible */
-				if (dtask->nr_fpages > 0 &&
-					dtask->nr_fpages < STROM_RAM2GPU_MAXPAGES &&
-					page_ofs == 0 &&
-					((dtask->page_ofs +
-					  dtask->copy_len) & (PAGE_CACHE_SIZE - 1)) == 0 &&
-					dtask->dest_offset + dtask->copy_len == curr_offset)
-				{
-					dtask->file_pages[dtask->nr_fpages] = fpage;
-					dtask->copy_len += page_len;
-					dtask->nr_fpages++;
-				}
-				else
-				{
-					/* submit if any pending request */
-					if (dtask->nr_fpages > 0)
-					{
-						retval = submit_ram2gpu_memcpy(dtask);
-						if (retval)
-						{
-							prDebug("submit_ram2gpu_memcpy() = %ld", retval);
-							return retval;
-						}
-						Assert(dtask->nr_fpages == 0);
-					}
-					/* This page becomes the first pending page */
-					dtask->page_ofs		= page_ofs;
-					dtask->copy_len		= page_len;
-					dtask->file_pages[0]	= fpage;
-					dtask->nr_fpages		= 1;
-					dtask->dest_offset		= curr_offset;
-				}
-			}
-			else
-			{
-				struct buffer_head	bh;
-				sector_t			lba_curr;
-				unsigned int		nr_blocks;
-
-				/* Submit RAM2GPU Async Memcpy if any */
-				if (dtask->nr_fpages > 0)
-				{
-					retval = submit_ram2gpu_memcpy(dtask);
-					if (retval)
-					{
-						prDebug("submit_ram2gpu_memcpy() = %ld", retval);
-						return retval;
-					}
-					Assert(dtask->nr_fpages == 0);
-				}
-
-				/* Lookup underlying block number */
-				memset(&bh, 0, sizeof(bh));
-				bh.b_size = dtask->blocksz;
-
-				retval = strom_get_block(filp->f_inode,
-										 pos >> dtask->blocksz_shift,
-										 &bh, 0);
-				if (retval)
-				{
-					prDebug("strom_get_block() = %ld", retval);
-					return retval;
-				}
-				lba_curr = bh.b_blocknr + (page_ofs >> dtask->blocksz_shift);
-				nr_blocks = (page_len >> dtask->blocksz_shift);
-				/* Is it merginable with the pending request? */
-				if (dtask->nr_blocks > 0 &&
-					dtask->nr_blocks + nr_blocks <= dtask->max_nblocks &&
-					dtask->src_block + dtask->nr_blocks == lba_curr)
-				{
-					dtask->nr_blocks += nr_blocks;
-				}
-				else
-				{
-					/* Submit the latest pending blocks but not merginable */
-					if (dtask->nr_blocks > 0)
-					{
-						retval = submit_ssd2gpu_memcpy(dtask);
-						if (retval)
-						{
-							prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
-							return retval;
-						}
-						Assert(dtask->nr_blocks == 0);
-					}
-					/* This block becomes new head of the pending request */
-					dtask->src_block = lba_curr;
-					dtask->nr_blocks = nr_blocks;
-					dtask->dest_offset = curr_offset;
-				}
-			}
-			curr_offset += page_len;
-			pos += page_len;
-		}
-	}
-	/* Submit pending SSD2GPU request, if any */
-	if (dtask->nr_blocks > 0)
-	{
-		Assert(dtask->nr_fpages == 0);
-		retval = submit_ssd2gpu_memcpy(dtask);
-		if (retval)
-			prDebug("submit_ssd2gpu_memcpy() = %ld", retval);
-	}
-	else if (dtask->nr_fpages > 0)
-	{
-		Assert(dtask->nr_blocks == 0);
-		retval = submit_ram2gpu_memcpy(dtask);
-		if (retval)
-			prDebug("submit_ram2gpu_memcpy() = %ld", retval);
-	}
-	return retval;
-}
-
-/*
- * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU(_ASYNC)
- */
-static long
-ioctl_memcpy_ssd2gpu_async(StromCmd__MemCpySsdToGpu __user *uarg,
-						   struct file *ioctl_filp,
-						   bool do_sync)
-{
-	StromCmd__MemCpySsdToGpu karg;
-	strom_dma_chunk	   *dchunks;
-	strom_dma_task	   *dtask;
-	unsigned long		dma_task_id;
-	long				retval;
-
-	/* copy ioctl(2) arguments from the userspace */
-	if (copy_from_user(&karg, uarg,
-					   offsetof(StromCmd__MemCpySsdToGpu, chunks)))
-		return -EFAULT;
-	dchunks = kmalloc(sizeof(strom_dma_chunk) * karg.nchunks, GFP_KERNEL);
-	if (!dchunks)
-		return -ENOMEM;
-	if (copy_from_user(dchunks, uarg->chunks,
-					   sizeof(strom_dma_chunk) * karg.nchunks))
-	{
-		kfree(dchunks);
-		return -EFAULT;
-	}
-
-	/* construct dma_task and dma_state */
-	dtask = strom_create_dma_task(karg.handle,
-								  karg.fdesc,
-								  ioctl_filp);
-	if (IS_ERR(dtask))
-		return PTR_ERR(dtask);
-	dma_task_id = dtask->dma_task_id;
-
-	/* then, submit asynchronous DMA requests */
-	retval = do_ssd2gpu_async_memcpy(dtask, karg.nchunks, dchunks);
-	/* no async jobs will acquire the dtask any more */
-	dtask->frozen = true;
-	barrier();
-	/* release resources no longer referenced */
-	strom_put_dma_task(dtask, retval);
-
-	/* inform the dma_task_id to userspace */
-	if (retval == 0 && put_user(dma_task_id, &uarg->dma_task_id))
-		retval = -EFAULT;
-	/* synchronization if necessary */
-	if (retval || do_sync)
-		strom_memcpy_ssd2gpu_wait(dma_task_id, NULL, TASK_UNINTERRUPTIBLE);
-
-	kfree(dchunks);
-
-	return retval;
-}
-
-/*
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WAIT
  */
 static int
@@ -1633,7 +1215,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 
 	for (i=0; i < nr_pages; i++)
 	{
-		fpage = dtask->file_pages[i];
+		fpage = dtask->file_pages[dtask->nr_fpages + i];
 
 		/* Synchronous read, if not cached */
 		if (!fpage)
@@ -1672,23 +1254,21 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 		page_cache_release(fpage);
 
 		/* Error? */
-		if (left)
+		if (unlikely(left))
 		{
-			retval = -EFAULT;
+			while (++i < nr_pages)
+			{
+				fpage = dtask->file_pages[dtask->nr_fpages + i];
+				if (fpage)
+				{
+					unlock_page(fpage);
+					page_cache_release(fpage);
+				}
+				retval = -EFAULT;
+			}
 			break;
 		}
 		dest_uaddr += PAGE_CACHE_SIZE;
-	}
-
-	/* Error? */
-	while (unlikely(i < nr_pages))
-	{
-		fpage = dtask->file_pages[i++];
-		if (fpage)
-		{
-			unlock_page(fpage);
-			page_cache_release(fpage);
-		}
 	}
 	return retval;
 }
@@ -1704,119 +1284,90 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 							unsigned int *p_nr_dma_submit,
 							unsigned int *p_nr_dma_blocks)
 {
-	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	struct file		   *filp = dtask->filp;
 	struct page		   *fpage;
-	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 	struct buffer_head	bh;
 	unsigned int		nr_blocks;
-	uint64_t			phy_addr;
 	loff_t				curr_offset = dest_offset;
 	int					i, j, retval = 0;
 
-	for (i=0; i < nr_pages; i++, fpos += PAGE_CACHE_SIZE)
+	for (i=0, j = dtask->nr_fpages;
+		 i < nr_pages;
+		 i++, j++, fpos += PAGE_CACHE_SIZE)
 	{
-		fpage = dtask->file_pages[i];
-		if (fpage && PageDirty(fpage))
-		{
-			size_t		page_len = PAGE_CACHE_SIZE;
-			size_t		page_ofs = 0;
-			size_t		copy_len;
-			char	   *saddr;
-			char	   *daddr;
+		fpage = dtask->file_pages[j];
+		Assert(!PageDirty(fpage));
 
-			/* submit SSD2GPU DMA */
+		/* lookup the source block number */
+		memset(&bh, 0, sizeof(bh));
+		bh.b_size = dtask->blocksz;
+
+		retval = strom_get_block(filp->f_inode,
+								 fpos >> dtask->blocksz_shift,
+								 &bh, 0);
+		if (retval)
+		{
+			prError("strom_get_block: %d", retval);
+			break;
+		}
+		nr_blocks = PAGE_CACHE_SIZE >> dtask->blocksz_shift;
+
+		/* merge with pending request if possible */
+		if (dtask->nr_blocks > 0 &&
+			dtask->nr_blocks + nr_blocks <= dtask->max_nblocks &&
+			dtask->src_block + dtask->nr_blocks == bh.b_blocknr &&
+			dtask->dest_offset +
+			dtask->nr_blocks * dtask->blocksz == curr_offset)
+		{
+			dtask->nr_blocks += nr_blocks;
+			dtask->nr_fpages++;
+		}
+		else
+		{
+			/* submit pending SSD2GPU DMA */
 			if (dtask->nr_blocks > 0)
 			{
 				(*p_nr_dma_submit)++;
 				(*p_nr_dma_blocks) += dtask->nr_blocks;
-				submit_ssd2gpu_memcpy(dtask);
-			}
-			/* dirty page must be copied by CPU, synchronously */
-			while (page_len > 0)
-			{
-				j = curr_offset >> mgmem->gpu_page_shift;
-				if (!dtask->dest_iomap || j != dtask->dest_index)
+				retval = submit_ssd2gpu_memcpy(dtask);
+				if (retval)
 				{
-					if (dtask->dest_iomap)
-						iounmap(dtask->dest_iomap);
-					phy_addr = page_table->pages[j]->physical_address;
-					dtask->dest_iomap = ioremap_wc(phy_addr,
-												   mgmem->gpu_page_sz);
-					if (!dtask->dest_iomap)
-					{
-						retval = -ENOMEM;
-						goto out;
-					}
-					dtask->dest_index = j;
+					prError("submit_ssd2gpu_memcpy: %d", retval);
+					break;
 				}
-				copy_len = page_len;
-				if (j != ((curr_offset + copy_len) >> mgmem->gpu_page_shift))
-					copy_len = (mgmem->gpu_page_sz -
-								(curr_offset & (mgmem->gpu_page_sz - 1)));
-				Assert(copy_len <= page_len);
-				/* Sync copy by CPU */
-				daddr = (dtask->dest_iomap +
-						 (curr_offset & (mgmem->gpu_page_sz - 1)));
-				saddr = kmap_atomic(fpage);
-				memcpy_toio(daddr, saddr + page_ofs, copy_len);
-				kunmap_atomic(saddr);
 
-				curr_offset += copy_len;
-				page_ofs += copy_len;
-				page_len -= copy_len;
+				/*
+				 * file_page[0...nr_fpages-1] shall be unlocked and released
+				 * on the callback routine of DMA submission
+				 */
+				memmove(dtask->file_pages,
+						dtask->file_pages + dtask->nr_fpages,
+						sizeof(struct page *) * (nr_pages - i));
 			}
+			dtask->dest_offset = curr_offset;
+			dtask->src_block = bh.b_blocknr;
+			dtask->nr_blocks = nr_blocks;
+			dtask->nr_fpages = 1;
+			j = 0;
 		}
-		else
-		{
-			/* lookup the source block number */
-			memset(&bh, 0, sizeof(bh));
-			bh.b_size = dtask->blocksz;
-
-			retval = strom_get_block(filp->f_inode,
-									 fpos >> dtask->blocksz_shift,
-									 &bh, 0);
-			if (retval)
-			{
-				prError("strom_get_block: %d", retval);
-				goto out;
-			}
-			nr_blocks = PAGE_CACHE_SIZE >> dtask->blocksz_shift;
-
-			/* merge with pending request if possible */
-			if (dtask->nr_blocks > 0 &&
-				dtask->nr_blocks + nr_blocks <= dtask->max_nblocks &&
-				dtask->src_block + dtask->nr_blocks == bh.b_blocknr &&
-				dtask->dest_offset +
-				dtask->nr_blocks * dtask->blocksz == curr_offset)
-			{
-				dtask->nr_blocks += nr_blocks;
-			}
-			else
-			{
-				/* submit pending SSD2GPU DMA */
-				if (dtask->nr_blocks > 0)
-				{
-					(*p_nr_dma_submit)++;
-					(*p_nr_dma_blocks) += dtask->nr_blocks;
-					submit_ssd2gpu_memcpy(dtask);
-				}
-				dtask->src_block = bh.b_blocknr;
-				dtask->nr_blocks = nr_blocks;
-				dtask->dest_offset = curr_offset;
-			}
-			curr_offset += PAGE_CACHE_SIZE;
-		}
+		curr_offset += PAGE_CACHE_SIZE;
 	}
-out:
-	/* Error? */
-	while (unlikely(i < nr_pages))
+
+	/*
+	 * Needs to unlock/release all the pending file cache pages
+	 */
+	if (retval)
 	{
-		fpage = dtask->file_pages[i++];
-		if (fpage)
+		int		n = dtask->nr_fpages + (nr_pages - i);
+
+		for (j=0; j < n; j++)
 		{
-			unlock_page(fpage);
-			page_cache_release(fpage);
+			fpage = dtask->file_pages[j];
+			if (fpage)
+			{
+				unlock_page(fpage);
+				page_cache_release(fpage);
+			}
 		}
 	}
 	return retval;
@@ -1826,17 +1377,10 @@ out:
  * main logic of STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK
  */
 static int
-memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
-						 size_t buffer_offset,
-						 size_t chunk_size,
-						 int nchunks,
-						 loff_t *file_pos,
-						 uint32_t *block_nums,
-						 char __user *block_data,
-						 unsigned int *p_nr_ram2gpu,
-						 unsigned int *p_nr_ssd2gpu,
-						 unsigned int *p_nr_dma_submit,
-						 unsigned int *p_nr_dma_blocks)
+memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
+						 strom_dma_task *dtask,
+						 uint32_t *chunk_ids_in,
+						 uint32_t *chunk_ids_out)
 {
 	mapped_gpu_memory *mgmem = dtask->mgmem;
 	struct file	   *filp = dtask->filp;
@@ -1844,83 +1388,83 @@ memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 	size_t			dest_offset;
 	unsigned int	nr_ram2gpu = 0;
 	unsigned int	nr_ssd2gpu = 0;
-	unsigned int	nr_dma_submit = 0;
-	unsigned int	nr_dma_blocks = 0;
-	unsigned int	n_pages = chunk_size >> PAGE_CACHE_SHIFT;
-	int				threshold = n_pages / 2;
+	unsigned int	nr_pages = (karg->chunk_sz >> PAGE_CACHE_SHIFT);
+	int				threshold = nr_pages / 2;
 	size_t			i_size;
 	int				retval = 0;
 	int				i, j;
 
 	/* sanity checks */
-	if ((chunk_size & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
-		chunk_size < PAGE_CACHE_SIZE ||					/* >= 4KB */
-		chunk_size > STROM_DMA_SSD2GPU_MAXLEN)			/* <= 128KB */
+	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
+		karg->chunk_sz < PAGE_CACHE_SIZE ||					/* >= 4KB */
+		karg->chunk_sz > STROM_DMA_SSD2GPU_MAXLEN)			/* <= 128KB */
 		return -EINVAL;
 
-	dest_offset = mgmem->map_offset + buffer_offset;
-	if (dest_offset + nchunks * chunk_size > mgmem->map_length)
+	dest_offset = mgmem->map_offset + karg->offset;
+	if (dest_offset + karg->nr_chunks * karg->chunk_sz > mgmem->map_length)
 		return -ERANGE;
 
 	i_size = i_size_read(filp->f_inode);
-	for (i=0; i < nchunks; i++)
+	for (i=0; i < karg->nr_chunks; i++)
 	{
-		uint32_t		curr_block_id = (block_nums ? block_nums[i] : ~0);
-		loff_t			fpos = file_pos[i];
+		uint32_t		chunk_id = (karg->relseg_sz == 0
+									? chunk_ids_in[i]
+									: chunk_ids_in[i] % karg->relseg_sz);
+		loff_t			fpos = chunk_id * karg->chunk_sz;
 		struct page	   *fpage;
 		int				score = 0;
 
-		/* sanity checks */
-		if ((fpos & (PAGE_CACHE_SIZE - 1)) != 0)
-			return -EINVAL;
-		if ((fpos + chunk_size) > i_size)
+		Assert((fpos & (PAGE_CACHE_SIZE - 1)) != 0);
+		if (fpos > i_size)
 			return -ERANGE;
 
-		for (j=0; j < n_pages; j++, fpos += PAGE_CACHE_SIZE)
+		for (j=0; j < nr_pages; j++, fpos += PAGE_CACHE_SIZE)
 		{
+			Assert(dtask->nr_fpages + j < STROM_DMA_MAX_NR_FPAGES);
 			fpage = find_lock_page(filp->f_mapping,
 								   fpos >> PAGE_CACHE_SHIFT);
-			dtask->file_pages[j] = fpage;
+			dtask->file_pages[dtask->nr_fpages + j] = fpage;
 			if (fpage)
-				score += (PageDirty(fpage) ? 3 : 1);
+				score += (PageDirty(fpage) ? threshold + 1 : 1);
 		}
 
 		if (score > threshold)
 		{
+			/*
+			 * Write-back of file pages if majority of the chunk is cached
+			 * on memory, then application will kick MemCpyHtoD for RAM2GPU
+			 * DMA.
+			 */
 			nr_ram2gpu++;
-			dest_uaddr = block_data + chunk_size * (nchunks - nr_ram2gpu);
-			retval = __memcpy_ssd2gpu_writeback(dtask, n_pages,
-												file_pos[i],
+			dest_uaddr = (karg->wb_buffer +
+						  karg->chunk_sz * (karg->nr_chunks - nr_ram2gpu));
+			retval = __memcpy_ssd2gpu_writeback(dtask,
+												nr_pages,
+												fpos,
 												dest_uaddr);
-			if (block_nums)
-				block_nums[2 * nchunks - nr_ram2gpu] = curr_block_id;
+			chunk_ids_out[karg->nr_chunks - nr_ram2gpu] = chunk_id;
 		}
 		else
 		{
-			__memcpy_ssd2gpu_submit_dma(dtask, n_pages,
-										file_pos[i],
-										dest_offset,
-										&nr_dma_submit,
-										&nr_dma_blocks);
-			if (block_nums)
-				block_nums[nchunks + nr_ssd2gpu] = curr_block_id;
-			dest_offset += chunk_size;
+			retval = __memcpy_ssd2gpu_submit_dma(dtask,
+												 nr_pages,
+												 fpos,
+												 dest_offset,
+												 &karg->nr_dma_submit,
+												 &karg->nr_dma_blocks);
+			chunk_ids_out[nr_ssd2gpu] = chunk_id;
+			dest_offset += karg->chunk_sz;
 			nr_ssd2gpu++;
 		}
 	}
 	/* submit pending SSD2GPU DMA request, if any */
 	if (dtask->nr_blocks > 0)
 	{
-		nr_dma_submit++;
-		nr_dma_blocks += dtask->nr_blocks;
+		karg->nr_dma_submit++;
+		karg->nr_dma_blocks += dtask->nr_blocks;
 		submit_ssd2gpu_memcpy(dtask);
 	}
-
-	Assert(nr_ram2gpu + nr_ssd2gpu == nchunks);
-	*p_nr_ram2gpu = nr_ram2gpu;
-	*p_nr_ssd2gpu = nr_ssd2gpu;
-	*p_nr_dma_submit = nr_dma_submit;
-	*p_nr_dma_blocks = nr_dma_blocks;
+	Assert(karg->nr_ram2gpu + karg->nr_ssd2gpu == karg->nr_chunks);
 
 	return 0;
 }
@@ -1934,44 +1478,24 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 {
 	StromCmd__MemCpySsdToGpuWriteBack karg;
 	strom_dma_task *dtask;
-	loff_t		   *file_pos = NULL;
-	uint32_t	   *block_nums = NULL;
+	uint32_t	   *chunk_ids_in = NULL;
+	uint32_t	   *chunk_ids_out = NULL;
 	int				retval;
 
-	if (copy_from_user(&karg, uarg,
-					   offsetof(StromCmd__MemCpySsdToGpuWriteBack, file_pos)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpuWriteBack)))
 		return -EFAULT;
-
-	/* move the @file_pos array */
-	file_pos = kmalloc(sizeof(loff_t) * karg.nchunks, GFP_KERNEL);
-	if (!file_pos)
+	chunk_ids_in = kmalloc(2 * sizeof(uint32_t) * karg.nr_chunks, GFP_KERNEL);
+	if (!chunk_ids_in)
 		return -ENOMEM;
-	if (copy_from_user(file_pos, uarg->file_pos,
-					   sizeof(loff_t) * karg.nchunks))
+	if (copy_from_user(chunk_ids_in, karg.chunk_ids,
+					   sizeof(uint32_t) * karg.nr_chunks))
 	{
 		retval = -EFAULT;
 		goto out;
 	}
+	chunk_ids_out = chunk_ids_in + karg.nr_chunks;
 
-	/* move the @block_nums array, if any */
-	if (!karg.block_nums)
-		block_nums = NULL;
-	else
-	{
-		block_nums = kmalloc(sizeof(uint32_t) * 2 * karg.nchunks, GFP_KERNEL);
-		if (!block_nums)
-		{
-			retval = -ENOMEM;
-			goto out;
-		}
-		if (copy_from_user(block_nums, karg.block_nums,
-						   sizeof(uint32_t) * karg.nchunks))
-		{
-			retval = -EFAULT;
-			goto out;
-		}
-	}
-
+	/* setup DMA task */
 	dtask = strom_create_dma_task(karg.handle,
 								  karg.file_desc,
 								  ioctl_filp);
@@ -1986,17 +1510,9 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	karg.nr_dma_submit = 0;
 	karg.nr_dma_blocks = 0;
 	
-	retval = memcpy_ssd2gpu_writeback(dtask,
-									  karg.offset,
-									  karg.block_size,
-									  karg.nchunks,
-									  file_pos,
-									  block_nums,	/* may be NULL */
-									  karg.block_data,	/* __user */
-									  &karg.nr_ram2gpu,
-									  &karg.nr_ssd2gpu,
-									  &karg.nr_dma_submit,
-									  &karg.nr_dma_blocks);
+	retval = memcpy_ssd2gpu_writeback(&karg, dtask,
+									  chunk_ids_in,
+									  chunk_ids_out);
 	/* no more async jobs shall not acquire the @dtask any more */
 	dtask->frozen = true;
 	barrier();
@@ -2009,9 +1525,8 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 		if (copy_to_user(uarg, &karg,
 						 offsetof(StromCmd__MemCpySsdToGpuWriteBack, handle)))
 			retval = -EFAULT;
-		if (block_nums &&
-			copy_to_user(karg.block_nums, block_nums + karg.nchunks,
-						 sizeof(uint32_t) * karg.nchunks))
+		else if (copy_to_user(karg.chunk_ids, chunk_ids_out,
+							  sizeof(uint32_t) * karg.nr_chunks))
 			retval = -EFAULT;
 	}
 	/* synchronization of completion if any error */
@@ -2019,8 +1534,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 		strom_memcpy_ssd2gpu_wait(karg.dma_task_id, NULL,
 								  TASK_UNINTERRUPTIBLE);
 out:
-	kfree(block_nums);
-	kfree(file_pos);
+	kfree(chunk_ids_in);
 	return retval;
 }
 
@@ -2116,26 +1630,14 @@ strom_proc_ioctl(struct file *ioctl_filp,
 			retval = ioctl_info_gpu_memory((void __user *) arg);
 			break;
 
-		case STROM_IOCTL__MEMCPY_SSD2GPU:
-			retval = ioctl_memcpy_ssd2gpu_async((void __user *) arg,
-												ioctl_filp,
-												true);
-			break;
-
-		case STROM_IOCTL__MEMCPY_SSD2GPU_ASYNC:
-			retval = ioctl_memcpy_ssd2gpu_async((void __user *) arg,
-												ioctl_filp,
-												false);
+		case STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK:
+			retval = ioctl_memcpy_ssd2gpu_writeback((void __user *) arg,
+													ioctl_filp);
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
 											   ioctl_filp);
-			break;
-
-		case STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK:
-			retval = ioctl_memcpy_ssd2gpu_writeback((void __user *) arg,
-													ioctl_filp);
 			break;
 
 		default:
