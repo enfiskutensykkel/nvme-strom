@@ -15,8 +15,6 @@ struct strom_ssd2gpu_request {
 	strom_dma_task	   *dtask;
 	struct request	   *req;
 	struct nvme_iod	   *iod;
-	unsigned int		nr_fpages;
-	struct page		   *file_pages[0];
 };
 typedef struct strom_ssd2gpu_request	strom_ssd2gpu_request;
 
@@ -73,7 +71,6 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	strom_ssd2gpu_request *ssd2gpu_req = (strom_ssd2gpu_request *) ctx;
 	int		dma_status = le16_to_cpup(&cqe->status) >> 1;
 	u32		dma_result = le32_to_cpup(&cqe->result);
-	int		i;
 
 	/*
 	 * FIXME: dma_status is one of NVME_SC_* (like NVME_SC_SUCCESS)
@@ -85,16 +82,6 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	__nvme_free_iod(nvmeq->dev, ssd2gpu_req->iod);
 	blk_mq_free_request(ssd2gpu_req->req);
 	strom_put_dma_task(ssd2gpu_req->dtask, dma_status);
-
-	for (i=0; i < ssd2gpu_req->nr_fpages; i++)
-	{
-		struct page	   *fpage = ssd2gpu_req->file_pages[i];
-		if (fpage)
-		{
-			unlock_page(fpage);
-			page_cache_release(fpage);
-		}
-	}
 	kfree(ssd2gpu_req);
 }
 
@@ -184,9 +171,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 		return -ENOMEM;
 
 	/* submit an asynchronous command */
-	ssd2gpu_req = kzalloc(offsetof(strom_ssd2gpu_request,
-								   file_pages[dtask->nr_fpages]),
-						  GFP_KERNEL);
+	ssd2gpu_req = kzalloc(sizeof(strom_ssd2gpu_request), GFP_KERNEL);
 	if (!ssd2gpu_req)
 		return -ENOMEM;
 
@@ -202,9 +187,6 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 	ssd2gpu_req->req = req;
 	ssd2gpu_req->iod = iod;
 	ssd2gpu_req->dtask = strom_get_dma_task(dtask);
-	memcpy(ssd2gpu_req->file_pages,
-		   dtask->file_pages,
-		   sizeof(struct page *) * dtask->nr_fpages);
 
 	/* setup READ command */
 	if (req->cmd_flags & REQ_FUA)

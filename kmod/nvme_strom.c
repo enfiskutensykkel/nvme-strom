@@ -761,8 +761,6 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
  * length of DMA request.
  */
 #define STROM_DMA_SSD2GPU_MAXLEN		(128 * 1024)
-#define STROM_DMA_MAX_NR_FPAGES		\
-	(2 * STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE)
 
 struct strom_dma_task
 {
@@ -803,9 +801,8 @@ struct strom_dma_task
 	loff_t				dest_offset;/* current destination offset */
 	sector_t			src_block;	/* head of the source blocks */
 	unsigned int		nr_blocks;	/* # of the contigunous source blocks */
-
-	unsigned int		nr_fpages;	/* number of the pending pages */
-	struct page		   *file_pages[STROM_DMA_MAX_NR_FPAGES];
+	/* temporary buffer for locked page cache in a chunk */
+	struct page		   *file_pages[STROM_DMA_SSD2GPU_MAXLEN / PAGE_CACHE_SIZE];
 };
 typedef struct strom_dma_task	strom_dma_task;
 
@@ -888,16 +885,14 @@ strom_create_dma_task(unsigned long handle,
 	dtask->max_nblocks = STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift;
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
-
 	dtask->dest_offset	= 0;
 	dtask->src_block	= 0;
 	dtask->nr_blocks	= 0;
-	dtask->nr_fpages	= 0;
 
-    /* OK, this strom_dma_task is now tracked */
+	/* OK, this strom_dma_task is now tracked */
 	spin_lock_irqsave(&strom_dma_task_locks[dtask->hindex], flags);
 	list_add_rcu(&dtask->chain, &strom_dma_task_slots[dtask->hindex]);
-    spin_unlock_irqrestore(&strom_dma_task_locks[dtask->hindex], flags);
+	spin_unlock_irqrestore(&strom_dma_task_locks[dtask->hindex], flags);
 
 	return dtask;
 
@@ -1215,8 +1210,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 
 	for (i=0; i < nr_pages; i++)
 	{
-		fpage = dtask->file_pages[dtask->nr_fpages + i];
-
+		fpage = dtask->file_pages[i];
 		/* Synchronous read, if not cached */
 		if (!fpage)
 		{
@@ -1229,6 +1223,7 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 				break;
 			}
 			lock_page(fpage);
+			dtask->file_pages[i] = fpage;
 		}
 		Assert(fpage != NULL);
 
@@ -1244,29 +1239,17 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
 		}
 
 		/* Do it by the slow way, if needed */
-		if (left)
+		if (unlikely(left))
 		{
 			kaddr = kmap(fpage);
 			left = __copy_to_user(dest_uaddr, kaddr, PAGE_CACHE_SIZE);
 			kunmap(fpage);
-		}
-		unlock_page(fpage);
-		page_cache_release(fpage);
 
-		/* Error? */
-		if (unlikely(left))
-		{
-			while (++i < nr_pages)
+			if (unlikely(left))
 			{
-				fpage = dtask->file_pages[dtask->nr_fpages + i];
-				if (fpage)
-				{
-					unlock_page(fpage);
-					page_cache_release(fpage);
-				}
 				retval = -EFAULT;
+				break;
 			}
-			break;
 		}
 		dest_uaddr += PAGE_CACHE_SIZE;
 	}
@@ -1285,19 +1268,13 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 							unsigned int *p_nr_dma_blocks)
 {
 	struct file		   *filp = dtask->filp;
-	struct page		   *fpage;
 	struct buffer_head	bh;
 	unsigned int		nr_blocks;
 	loff_t				curr_offset = dest_offset;
 	int					i, j, retval = 0;
 
-	for (i=0, j = dtask->nr_fpages;
-		 i < nr_pages;
-		 i++, j++, fpos += PAGE_CACHE_SIZE)
+	for (i=0; i < nr_pages; i++, fpos += PAGE_CACHE_SIZE)
 	{
-		fpage = dtask->file_pages[j];
-		Assert(!fpage || !PageDirty(fpage));
-
 		/* lookup the source block number */
 		memset(&bh, 0, sizeof(bh));
 		bh.b_size = dtask->blocksz;
@@ -1320,7 +1297,6 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			dtask->nr_blocks * dtask->blocksz == curr_offset)
 		{
 			dtask->nr_blocks += nr_blocks;
-			dtask->nr_fpages++;
 		}
 		else
 		{
@@ -1335,40 +1311,13 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 					prError("submit_ssd2gpu_memcpy: %d", retval);
 					break;
 				}
-
-				/*
-				 * file_page[0...nr_fpages-1] shall be unlocked and released
-				 * on the callback routine of DMA submission
-				 */
-				memmove(dtask->file_pages,
-						dtask->file_pages + dtask->nr_fpages,
-						sizeof(struct page *) * (nr_pages - i));
 			}
 			dtask->dest_offset = curr_offset;
 			dtask->src_block = bh.b_blocknr;
 			dtask->nr_blocks = nr_blocks;
-			dtask->nr_fpages = 1;
 			j = 0;
 		}
 		curr_offset += PAGE_CACHE_SIZE;
-	}
-
-	/*
-	 * Needs to unlock/release all the pending file cache pages
-	 */
-	if (retval)
-	{
-		int		n = dtask->nr_fpages + (nr_pages - i);
-
-		for (j=0; j < n; j++)
-		{
-			fpage = dtask->file_pages[j];
-			if (fpage)
-			{
-				unlock_page(fpage);
-				page_cache_release(fpage);
-			}
-		}
 	}
 	return retval;
 }
@@ -1420,10 +1369,9 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 
 		for (j=0; j < nr_pages; j++, fpos += PAGE_CACHE_SIZE)
 		{
-			Assert(dtask->nr_fpages + j < STROM_DMA_MAX_NR_FPAGES);
 			fpage = find_lock_page(filp->f_mapping,
 								   fpos >> PAGE_CACHE_SHIFT);
-			dtask->file_pages[dtask->nr_fpages + j] = fpage;
+			dtask->file_pages[j] = fpage;
 			if (fpage)
 				score += (PageDirty(fpage) ? threshold + 1 : 1);
 		}
@@ -1455,6 +1403,26 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 			dest_offset += karg->chunk_sz;
 			karg->nr_ssd2gpu++;
 		}
+
+		/*
+		 * MEMO: score==0 means no pages were cached, so we can skip loop
+		 * to unlock/release pages. It's a small optimization.
+		 */
+		if (score > 0)
+		{
+			for (j=0; j < nr_pages; j++)
+			{
+				fpage = dtask->file_pages[j];
+				if (fpage)
+				{
+					unlock_page(fpage);
+					page_cache_release(fpage);
+				}
+			}
+		}
+
+		if (retval)
+			return retval;
 	}
 	/* submit pending SSD2GPU DMA request, if any */
 	if (dtask->nr_blocks > 0)
