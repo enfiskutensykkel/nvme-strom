@@ -35,6 +35,7 @@
 /* determine the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
+#include "md.rhel7.h"
 #else
 #error Not a supported Linux kernel
 #endif
@@ -650,6 +651,45 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	 * MEMO: Our assumption is, the supplied file is located on NVMe-SSD,
 	 * with other software layer (like dm-based RAID1).
 	 */
+#if 0
+	if (bd_disk->major == MD_MAJOR)
+	{
+		struct mddev   *mddev;
+		struct md_rdev *rdev;
+		int				index = 0;
+
+		/* unpartitioned md device has 'md%d' */
+		dname = bd_disk->disk_name;
+		if (dname[0] == 'm' &&
+			dname[1] == 'd')
+		{
+			const char *pos = dname + 2;
+
+			while (*pos >= '0' && *pos <= '9')
+				pos++;
+			if (*pos == '\0')
+				dname = NULL;
+		}
+
+		if (dname)
+		{
+			prError("block device '%s' is not supported", dname);
+			return -ENOTSUPP;
+		}
+		mddev = bd_disk->private_data;
+
+		prNotice("mddev {flags=%08lx suspended=%d ro=%d ready=%d major=%d minor=%d patch=%d persistent=%d}", mddev->flags, mddev->suspended, mddev->ro, mddev->ready, mddev->major_version, mddev->minor_version, mddev->patch_version, mddev->persistent);
+		prNotice("mddev {chunk_sectors=%d level=%d layout=%d raid_disks=%d max_disks=%d}", mddev->chunk_sectors, mddev->level, mddev->layout, mddev->raid_disks, mddev->max_disks);
+		prNotice("mddev {dev_sectors=%lu array_sectors=%lu external_size=%d}", (long)mddev->dev_sectors, (long)mddev->array_sectors, mddev->external_size);
+
+		rdev_for_each(rdev, mddev)
+		{
+			prNotice("rdev[%d] {sectors=%lu data_offset=%lu, new_data_offset=%lu sb_start=%lu}", index, (long)rdev->sectors, (long)rdev->data_offset, (long)rdev->new_data_offset, (long)rdev->sb_start);
+			index++;
+		}
+		return -ENOTSUPP;
+	}
+#endif
 
 	/* 'devext' shall wrap NVMe-SSD device */
 	if (bd_disk->major != BLOCK_EXT_MAJOR)
