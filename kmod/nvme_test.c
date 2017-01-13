@@ -188,15 +188,16 @@ callback_release_atask(CUstream cuda_stream, CUresult status, void *private)
 					   atask->flen, atask->fpos);
 		system_exit_on_error(nbytes < 0, "pread");
 
-        printf("pread(fdesc=%d,src_buf=%p,len=%zu,fpos=%lu)\n",
-			   atask->fdesc, atask->src_buffer,atask->flen, atask->fpos);
-		for (i=0; i * BLCKSZ < nbytes; i++)
+		for (i=0; (i+1) * BLCKSZ < nbytes; i++)
 		{
-			j = atask->block_nums[i];
+			j = atask->block_nums[i] % (chunk_size / BLCKSZ);
 			if (memcmp(atask->src_buffer + i * BLCKSZ,
 					   atask->dest_buffer + j * BLCKSZ,
 					   Min(nbytes - i * BLCKSZ, BLCKSZ)) != 0)
+			{
+				printf("i=%d j=%d\n", i, j);
 				system_exit_on_error(1, "memcmp");
+			}
 		}
 	}
 check_ok:
@@ -627,11 +628,11 @@ static void usage(const char *cmdname)
 	fprintf(stderr,
 			"usage: %s [OPTIONS] <filename>\n"
 			"    -d <device index>:        (default 0)\n"
-			"    -n <num of chunks>:       (default 6)\n"
-			"    -s <size of chunk in MB>: (default 32MB)\n"
+			"    -n <num of segments>:     (default 6)\n"
+			"    -s <segment size in MB>:  (default 32MB)\n"
 			"    -c : Enables corruption check (default off)\n"
-			"    -h : Print this message (default off)\n"
-			"    -f (<i/o size in KB>): Test by VFS access (default off)\n"
+			"    -h : Print this message   (default off)\n"
+			"    -f([<i/o size in KB>]): Test by VFS access (default off)\n"
 			"    -p (<map handle>): Print property of mapped device memory\n",
 			basename(strdup(cmdname)));
 	exit(1);
@@ -718,7 +719,13 @@ int main(int argc, char * const argv[])
 		fprintf(stderr, "failed on fstat(\"%s\"): %m\n", filename);
 		return 1;
 	}
-	filesize = (stbuf.st_size & ~(stbuf.st_blksize - 1));
+	filesize = (stbuf.st_size / chunk_size) * chunk_size;
+	if (filesize == 0)
+	{
+		fprintf(stderr, "file size (%zu) is smaller than segment size %zu",
+				filesize, chunk_size);
+		return 1;
+	}
 
 	/* is this file supported? */
 	ioctl_check_file(filename, fdesc);

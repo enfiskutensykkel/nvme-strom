@@ -1352,7 +1352,7 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 	i_size = i_size_read(filp->f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
 	{
-		uint32_t		chunk_id = chunk_ids_in[i];
+		loff_t			chunk_id = chunk_ids_in[i];
 		loff_t			fpos;
 		struct page	   *fpage;
 		int				score = 0;
@@ -1386,7 +1386,8 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 												nr_pages,
 												fpos,
 												dest_uaddr);
-			chunk_ids_out[karg->nr_chunks - karg->nr_ram2gpu] = chunk_id;
+			chunk_ids_out[karg->nr_chunks -
+						  karg->nr_ram2gpu] = (uint32_t)chunk_id;
 		}
 		else
 		{
@@ -1396,7 +1397,7 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 												 dest_offset,
 												 &karg->nr_dma_submit,
 												 &karg->nr_dma_blocks);
-			chunk_ids_out[karg->nr_ssd2gpu] = chunk_id;
+			chunk_ids_out[karg->nr_ssd2gpu] = (uint32_t)chunk_id;
 			dest_offset += karg->chunk_sz;
 			karg->nr_ssd2gpu++;
 		}
