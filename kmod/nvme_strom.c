@@ -36,6 +36,7 @@
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
 #include "md.rhel7.h"
+#include "raid0.rhel7.h"
 #else
 #error Not a supported Linux kernel
 #endif
@@ -569,6 +570,37 @@ strom_get_block(struct inode *inode, sector_t iblock,
 }
 
 /*
+ * strom_nvme_device
+ *
+ * Representation of the block device underlying the source file.
+ * We have two cases supported:
+ * 1. File is on a physical NVMe SSD device
+ * 2. File is on a logical MD(RAID-0) device that consists of all NVMe-SSD
+ */
+struct strom_nvme_raw_device
+{
+	struct nvme_ns *nvme_ns;		/* NVMe SSD namespace (=SCSI LUN) */
+	sector_t		start_sect;		/* first sector of the partition */
+
+	/* parameters for md raid-0 logical device */
+	sector_t		strip_zone_end;	/* @zone_end in strip_zone */
+};
+typedef struct strom_nvme_raw_device	strom_nvme_raw_device;
+
+struct strom_nvme_device
+{
+	int				nr_disks;	/* number of disks in RAID-0 configuration;
+								 * 0 means no RAID configuration, thus, only
+								 * ssd[0] is a valid device in this case. */
+	int				chunk_sectors;	/* unit size of RAID-0 stripe */
+	sector_t		md_start_sect;	/* offset of md-device if /dev/mdX has
+									 * partition table. */
+	struct r0conf  *raid0_conf;	/* MD RAID-0 zone definition */
+	strom_nvme_raw_device ssd[1];	/* flexible length */
+};
+typedef struct strom_nvme_device	strom_nvme_device;
+
+/*
  * ioctl_check_file - checks whether the supplied file descriptor is
  * capable to perform P2P DMA from NVMe SSD.
  * Here are various requirement on filesystem / devices.
@@ -581,6 +613,198 @@ strom_get_block(struct inode *inode, sector_t iblock,
  * - file has to be larger than or equal to PAGE_SIZE, because Ext4/XFS
  *   are capable to have file contents inline, for very small files.
  */
+
+/*
+ * __extblock_is_supported_nvme - checker for BLOCK_EXT_MAJOR
+ */
+static int
+__extblock_is_supported_nvme(struct block_device *blkdev,
+							 struct nvme_ns **p_nvme_ns)
+{
+	struct gendisk *bd_disk = blkdev->bd_disk;
+	struct nvme_ns *nvme_ns = (struct nvme_ns *)bd_disk->private_data;
+	const char	   *dname;
+	int				rc;
+
+	/* 'devext' is wrapper of NVMe-SSD device */
+	if (bd_disk->major != BLOCK_EXT_MAJOR)
+		return -ENOTSUPP;
+
+	/* disk_name should be 'nvme%dn%d' */
+	dname = bd_disk->disk_name;
+	if (dname[0] == 'n' &&
+		dname[1] == 'v' &&
+		dname[2] == 'm' &&
+		dname[3] == 'n')
+	{
+		const char	   *pos = dname + 4;
+		const char	   *pos_saved = pos;
+
+		while (*pos >= '0' && *pos <='9')
+			pos++;
+		if (pos > pos_saved && *pos == 'n')
+		{
+			pos_saved = ++pos;
+
+			while (*pos >= '0' && *pos <= '9')
+				pos++;
+			if (pos > pos_saved && *pos == '\0')
+				dname = NULL;	/* ok, it is NVMe-SSD */
+		}
+	}
+
+	if (dname)
+	{
+		prError("block device '%s' is not supported", dname);
+		return -ENOTSUPP;
+	}
+
+	/* try to call ioctl for device ping */
+	if (!bd_disk->fops->ioctl)
+	{
+		prError("block device '%s' does not provide ioctl",
+				bd_disk->disk_name);
+		return -ENOTSUPP;
+	}
+
+	rc = bd_disk->fops->ioctl(blkdev, 0, NVME_IOCTL_ID, 0UL);
+	if (rc < 0)
+	{
+		prError("ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d",
+				bd_disk->disk_name, rc);
+		return -ENOTSUPP;
+	}
+
+	/* OK, we assume the underlying device is supported NVMe-SSD */
+	if (p_nvme_ns)
+		*p_nvme_ns = nvme_ns;
+	return 0;
+}
+
+/*
+ * __mdblock_is_supported_nvme - checker for BLOCK_EXT_MAJOR
+ */
+static int
+__mdblock_is_supported_nvme(struct block_device *blkdev,
+							strom_nvme_device **p_nvme_dev)
+{
+	struct gendisk *bd_disk = blkdev->bd_disk;
+	const char	   *dname;
+	struct mddev   *mddev;
+	struct md_rdev *rdev;
+	strom_nvme_device *nvme_dev = NULL;
+	int				rc;
+
+	/* 'md' logical RAID volume is expected */
+    Assert(bd_disk->major == MD_MAJOR);
+
+	dname = bd_disk->disk_name;
+	if (dname[0] == 'm' &&
+		dname[1] == 'd')
+	{
+		const char *pos = dname + 2;
+		const char *pos_saved;
+
+		if (pos[0] == '_' &&
+			pos[1] == 'd')
+			pos += 2;
+		pos_saved = pos;
+		while (*pos >= '0' && *pos <= '9')
+			pos++;
+		if (pos > pos_saved && *pos == '\0')
+			dname = NULL;
+	}
+
+	if (dname)
+	{
+		prError("block device '%s' is not supported", dname);
+		return -ENOTSUPP;
+	}
+
+	/*
+	 * check md-raid configuration parameters
+	 */
+	mddev = bd_disk->private_data;
+	if (!mddev || !mddev->pers || !mddev->ready)
+	{
+		prError("md-device '%s' is not ready to handle i/o",
+				bd_disk->disk_name);
+		return -ENOTSUPP;
+	}
+
+	// TODO: If mddev->suspended, we may need a loop like
+	// md_make_request, or simply abort.
+	// we don't need to care about 'ro'
+
+
+	if (mddev->raid_disks == 0)
+	{
+		prError("md-device '%s' contains no underlying disks",
+				bd_disk->disk_name);
+		return -ENOTSUPP;
+	}
+	prNotice("raid_disks = %d", mddev->raid_disks);
+
+	if (mddev->level != 0 || mddev->layout != 0)
+	{
+		prError("md-device '%s' is not configured as RAID-0 volume",
+				bd_disk->disk_name);
+		return -ENOTSUPP;
+	}
+
+	if (mddev->chunk_sectors < (PAGE_CACHE_SIZE >> 9) ||
+		(mddev->chunk_sectors & ((PAGE_CACHE_SIZE >> 9) - 1)) != 0)
+	{
+		prError("md-device '%s' has invalid stripe size: %zu",
+				bd_disk->disk_name, (size_t)mddev->chunk_sectors << 9);
+		return -ENOTSUPP;
+	}
+
+	if (p_nvme_dev)
+	{
+		nvme_dev = kzalloc(offsetof(strom_nvme_device,
+									ssd[mddev->raid_disks]), GFP_KERNEL);
+		if (!nvme_dev)
+			return -ENOMEM;
+		nvme_dev->nr_disks = mddev->raid_disks;
+		nvme_dev->chunk_sectors = mddev->chunk_sectors;
+		/* 'mdXX' device has partition table? */
+		if (blkdev->bd_part)
+			nvme_dev->md_start_sect = blkdev->bd_part->start_sect;
+		nvme_dev->raid0_conf = mddev->private;
+	}
+
+	/* check for each underlying devices */
+	rdev_for_each(rdev, mddev)
+	{
+		struct block_device	*s_bdev = rdev->bdev;
+		struct gendisk		*s_disk = s_bdev->bd_disk;
+
+		rc = __extblock_is_supported_nvme(s_bdev, NULL);
+		if (rc)
+		{
+			prError("md-device '%s' - disk[%d] is not NVMe-SSD",
+					bd_disk->disk_name, rdev->desc_nr);
+			kfree(nvme_dev);
+			return rc;
+		}
+		Assert(rdev->desc_nr < mddev->raid_disks);
+		if (nvme_dev)
+		{
+			strom_nvme_raw_device *ssd = &nvme_dev->ssd[rdev->desc_nr];
+
+			ssd->nvme_ns = (struct nvme_ns *)s_disk->private_data;
+			ssd->start_sect = (s_bdev->bd_part ?
+							   s_bdev->bd_part->start_sect : 0);
+
+		}
+	}
+	return -ENOTSUPP;
+}
+
+/*
+ * file_is_supported_nvme
+ */
 static int
 file_is_supported_nvme(struct file *filp, bool is_writable,
 					   struct nvme_ns **p_nvme_ns)
@@ -590,9 +814,6 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	struct file_system_type *s_type = i_sb->s_type;
 	struct block_device *s_bdev = i_sb->s_bdev;
 	struct gendisk	   *bd_disk = s_bdev->bd_disk;
-	struct nvme_ns	   *nvme_ns = (struct nvme_ns *)bd_disk->private_data;
-	const char		   *dname;
-	int					rc;
 
 	/*
 	 * must have proper permission to the target file
@@ -626,6 +847,21 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	}
 
 	/*
+	 * check block size of the filesystem
+	 *
+	 * MEMO: usually, Ext4/XFS on Linux shall not have block-size larger than
+	 * PAGE_CACHE_SIZE (although mkfs.xfs(8) mention about up to 64KB block-
+	 * size...).
+	 * For safety, we reject block-size larger than PAGE SIZE.
+	 */
+	if (i_sb->s_blocksize > PAGE_CACHE_SIZE)
+	{
+		prError("block size of '%s' is %zu; larger than PAGE_CACHE_SIZE",
+				bd_disk->disk_name, (size_t)i_sb->s_blocksize);
+		return -ENOTSUPP;
+	}
+
+	/*
 	 * check whether the file size is, at least, more than PAGE_SIZE
 	 *
 	 * MEMO: It is a rough alternative to prevent inline files on Ext4/XFS.
@@ -646,119 +882,18 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	}
 
 	/*
-	 * check whether underlying block device is NVMe-SSD
-	 *
-	 * MEMO: Our assumption is, the supplied file is located on NVMe-SSD,
-	 * with other software layer (like dm-based RAID1).
+	 * check whether the block device is either of:
+	 * 1. physical NVMe-SSD device, or
+	 * 2. logical MD RAID-0 device which consists of only NVMe-SSDs
 	 */
-#if 0
-	if (bd_disk->major == MD_MAJOR)
-	{
-		struct mddev   *mddev;
-		struct md_rdev *rdev;
-		int				index = 0;
+	if (bd_disk->major == BLOCK_EXT_MAJOR)
+		return __extblock_is_supported_nvme(s_bdev, p_nvme_ns);
+	else if (bd_disk->major == MD_MAJOR)
+		return __mdblock_is_supported_nvme(s_bdev, NULL);
 
-		/* unpartitioned md device has 'md%d' */
-		dname = bd_disk->disk_name;
-		if (dname[0] == 'm' &&
-			dname[1] == 'd')
-		{
-			const char *pos = dname + 2;
-
-			while (*pos >= '0' && *pos <= '9')
-				pos++;
-			if (*pos == '\0')
-				dname = NULL;
-		}
-
-		if (dname)
-		{
-			prError("block device '%s' is not supported", dname);
-			return -ENOTSUPP;
-		}
-		mddev = bd_disk->private_data;
-
-		prNotice("mddev {flags=%08lx suspended=%d ro=%d ready=%d major=%d minor=%d patch=%d persistent=%d}", mddev->flags, mddev->suspended, mddev->ro, mddev->ready, mddev->major_version, mddev->minor_version, mddev->patch_version, mddev->persistent);
-		prNotice("mddev {chunk_sectors=%d level=%d layout=%d raid_disks=%d max_disks=%d}", mddev->chunk_sectors, mddev->level, mddev->layout, mddev->raid_disks, mddev->max_disks);
-		prNotice("mddev {dev_sectors=%lu array_sectors=%lu external_size=%d}", (long)mddev->dev_sectors, (long)mddev->array_sectors, mddev->external_size);
-
-		rdev_for_each(rdev, mddev)
-		{
-			prNotice("rdev[%d] {sectors=%lu data_offset=%lu, new_data_offset=%lu sb_start=%lu}", index, (long)rdev->sectors, (long)rdev->data_offset, (long)rdev->new_data_offset, (long)rdev->sb_start);
-			index++;
-		}
-		return -ENOTSUPP;
-	}
-#endif
-
-	/* 'devext' shall wrap NVMe-SSD device */
-	if (bd_disk->major != BLOCK_EXT_MAJOR)
-	{
-		prError("block device major number = %d, not 'blkext'",
-				bd_disk->major);
-		return -ENOTSUPP;
-	}
-
-	/* disk_name should be 'nvme%dn%d' */
-	dname = bd_disk->disk_name;
-	if (dname[0] == 'n' &&
-		dname[1] == 'v' &&
-		dname[2] == 'm' &&
-		dname[3] == 'e')
-	{
-		const char *pos = dname + 4;
-		const char *pos_saved = pos;
-
-		while (*pos >= '0' && *pos <= '9')
-			pos++;
-		if (pos != pos_saved && *pos == 'n')
-		{
-			pos_saved = ++pos;
-
-			while (*pos >= '0' && *pos <= '9')
-				pos++;
-			if (pos != pos_saved && *pos == '\0')
-				dname = NULL;/* OK, it is NVMe-SSD */
-		}
-	}
-
-	if (dname)
-	{
-		prError("block device '%s' is not supported", dname);
-		return -ENOTSUPP;
-	}
-
-	/* try to call ioctl */
-	if (!bd_disk->fops->ioctl)
-	{
-		prError("block device '%s' does not provide ioctl",
-				bd_disk->disk_name);
-		return -ENOTSUPP;
-	}
-
-	rc = bd_disk->fops->ioctl(s_bdev, 0, NVME_IOCTL_ID, 0UL);
-	if (rc < 0)
-	{
-		prError("ioctl(NVME_IOCTL_ID) on '%s' returned an error: %d",
-				bd_disk->disk_name, rc);
-		return -ENOTSUPP;
-	}
-
-	/*
-	 * check block size of the device.
-	 */
-	if (i_sb->s_blocksize > PAGE_CACHE_SIZE)
-	{
-		prError("block size of '%s' is %zu; larger than PAGE_CACHE_SIZE",
-				bd_disk->disk_name, (size_t)i_sb->s_blocksize);
-		return -ENOTSUPP;
-	}
-
-	if (p_nvme_ns)
-		*p_nvme_ns = nvme_ns;
-
-	/* OK, we assume the underlying device is supported NVMe-SSD */
-	return 0;
+	prError("block device '%s' on behalf of the file is not supported",
+			bd_disk->disk_name);
+	return -ENOTSUPP;
 }
 
 /*
@@ -812,12 +947,12 @@ struct strom_dma_task
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
-	struct nvme_ns	   *nvme_ns;	/* NVMe namespace (=SCSI LUN) */
-	size_t				blocksz;	/* blocksize of this partition */
+	size_t				blocksz;	/* blocksize of the filesystem */
 	int					blocksz_shift;	/* log2 of 'blocksz' */
+
+	struct nvme_ns	   *nvme_ns;	/* NVMe namespace (=SCSI LUN) */
 	sector_t			start_sect;	/* first sector of the source partition */
 	sector_t			nr_sects;	/* number of sectors of the partition */
-	unsigned int		max_nblocks;/* upper limit of @nr_blocks */
 
 	/*
 	 * status of asynchronous tasks
@@ -922,7 +1057,6 @@ strom_create_dma_task(unsigned long handle,
 	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
 	dtask->start_sect	= s_bdev->bd_part->start_sect;
 	dtask->nr_sects		= s_bdev->bd_part->nr_sects;
-	dtask->max_nblocks = STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift;
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
 	dtask->dest_offset	= 0;
@@ -1308,6 +1442,8 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 {
 	struct file		   *filp = dtask->filp;
 	struct buffer_head	bh;
+	unsigned int		max_nr_blocks
+		= (STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift);
 	unsigned int		nr_blocks;
 	loff_t				curr_offset = dest_offset;
 	int					i, retval = 0;
@@ -1330,7 +1466,7 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 
 		/* merge with pending request if possible */
 		if (dtask->nr_blocks > 0 &&
-			dtask->nr_blocks + nr_blocks <= dtask->max_nblocks &&
+			dtask->nr_blocks + nr_blocks <= max_nr_blocks &&
 			dtask->src_block + dtask->nr_blocks == bh.b_blocknr &&
 			dtask->dest_offset +
 			dtask->nr_blocks * dtask->blocksz == curr_offset)
