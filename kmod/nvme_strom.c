@@ -762,7 +762,7 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	if (p_raid0_conf)
 		*p_raid0_conf = mddev->private;
 
-	return -ENOTSUPP;
+	return 0;
 }
 
 /*
