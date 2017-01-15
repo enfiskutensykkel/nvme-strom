@@ -92,6 +92,12 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 #define GPU_BOUND_OFFSET	(GPU_BOUND_SIZE-1)
 #define GPU_BOUND_MASK		(~GPU_BOUND_OFFSET)
 
+/*
+ * Macro definition for sector
+ */
+#define SECTOR_SHIFT		(9)
+#define SECTOR_SIZE			(1UL << SECTOR_SHIFT)
+
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
 
@@ -595,14 +601,18 @@ __extblock_is_supported_nvme(struct block_device *blkdev)
 
 	/* 'devext' is wrapper of NVMe-SSD device */
 	if (bd_disk->major != BLOCK_EXT_MAJOR)
+	{
+		prError("block device '%s' has unsupported major device number: %d",
+				bd_disk->disk_name, bd_disk->major);
 		return -ENOTSUPP;
+	}
 
 	/* disk_name should be 'nvme%dn%d' */
 	dname = bd_disk->disk_name;
 	if (dname[0] == 'n' &&
 		dname[1] == 'v' &&
 		dname[2] == 'm' &&
-		dname[3] == 'n')
+		dname[3] == 'e')
 	{
 		const char	   *pos = dname + 4;
 		const char	   *pos_saved = pos;
@@ -908,14 +918,10 @@ struct strom_dma_task
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
-	size_t				blocksz;	/* blocksize of the filesystem */
-	int					blocksz_shift;	/* log2 of 'blocksz' */
-
 	/* MD RAID-0 configuration, if any */
 	struct r0conf	   *raid0_conf;
 	/* current focus of the raw NVMe-SSD device */
 	struct nvme_ns	   *nvme_ns;	/* NVMe namespace (=SCSI LUN) */
-//	sector_t			start_sect;	/* first sector of the source partition */
 
 	/*
 	 * status of asynchronous tasks
@@ -937,8 +943,8 @@ struct strom_dma_task
 
 	/* state of the current pending SSD2GPU DMA request */
 	loff_t				dest_offset;/* current destination offset */
-	sector_t			src_block;	/* head of the source blocks */
-	unsigned int		nr_blocks;	/* # of the contigunous source blocks */
+	sector_t			head_sector;
+	unsigned int		nr_sectors;
 	/* temporary buffer for locked page cache in a chunk */
 	struct page		   *file_pages[STROM_DMA_SSD2GPU_MAXLEN / PAGE_CACHE_SIZE];
 };
@@ -1016,15 +1022,11 @@ strom_create_dma_task(unsigned long handle,
     dtask->filp			= filp;
 	dtask->raid0_conf	= raid0_conf;
 	dtask->nvme_ns		= NULL;		/* to be set later */
-//	dtask->start_sect	= 0;		/* to be set later */
-	dtask->blocksz		= i_sb->s_blocksize;
-	dtask->blocksz_shift = i_sb->s_blocksize_bits;
-	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
 	dtask->dest_offset	= 0;
-	dtask->src_block	= 0;
-	dtask->nr_blocks	= 0;
+	dtask->head_sector	= 0;
+	dtask->nr_sectors	= 0;
 
 	/*
 	 * If no MD RAID-0 configuration here, the focused NVMe-SSD will not be
@@ -1035,8 +1037,6 @@ strom_create_dma_task(unsigned long handle,
 		struct gendisk	   *bd_disk = s_bdev->bd_disk;
 
 		dtask->nvme_ns	= (struct nvme_ns *)bd_disk->private_data;
-//		if (s_bdev->bd_part)
-//			dtask->start_sect = s_bdev->bd_part->start_sect;
 	}
 
 	/* OK, this strom_dma_task is now tracked */
@@ -1155,74 +1155,68 @@ find_zone(struct r0conf *conf, sector_t *p_sector)
 	return NULL;
 }
 
-static int
+static struct nvme_ns *
 strom_raid0_map_sector(struct r0conf *raid0_conf,
 					   struct mddev *mddev,
-					   struct nvme_ns **p_nvme_ns,
-					   sector_t *p_block_pos,
-					   unsigned int *p_nr_blocks)
+					   sector_t *p_sector,
+					   unsigned int nr_sects)
 {
-#if 0
 	struct strip_zone  *zone;
-	struct nvme_ns	   *nvme_ns;
-	sector_t			sector = *p_block_pos;
-	unsigned int		nr_blocks = *p_nr_blocks;
-	unsigned int		sect_in_chunk;
+	struct md_rdev	   *rdev;
+	sector_t			sector = *p_sector;
 	sector_t			chunk;
+	unsigned int		sect_in_chunk;
 	int					raid_disks = raid0_conf->strip_zone[0].nb_dev;
 	unsigned int		chunk_sects = mddev->chunk_sectors;
 
-	zone = find_zone(raid0_conf, sector);
+	/*
+	 * Ensure (sector)...(sector + nr_sects) does not go across the chunk
+	 * boundary.
+	 */
+	if (sector / chunk_sects != (sector + nr_sects) / chunk_sects)
+	{
+		prError("Bug? page-aligned i/o goes across boundary of md raid-0"
+				" (sector=%ld, nr_sect=%u, chunk_sects=%ld)",
+				(long)sector, nr_sects, (long)chunk_sects);
+		return ERR_PTR(-ESPIPE);
+	}
+
+	zone = find_zone(raid0_conf, &sector);
 	if (!zone)
 	{
 		prError("sector='%lu': out of range in md raid-0 configuration",
-				sector);
-		return -ERANGE;
+				*p_sector);
+		return ERR_PTR(-ERANGE);
 	}
 
+	chunk = sector;
 	if ((chunk_sects & (chunk_sects - 1)) == 0)		/* power of 2? */
 	{
 		int			chunksect_bits = ffz(~chunk_sects);
 		/* find the sector offset inside the chunk */
 		sect_in_chunk = sector & (chunk_sects - 1);
 		sector >>= chunksect_bits;
-		/* chunk in zone */
-		chunk = *sector_offset;
-		/* quotient is the chunk in real device*/
+		/* chunk in zone; quotient is the chunk in real device*/
 		sector_div(chunk, zone->nb_dev << chunksect_bits);
 	}
 	else
 	{
 		sect_in_chunk = sector_div(sector, chunk_sects);
-		chunk = *sector_offset;
 		sector_div(chunk, chunk_sects * zone->nb_dev);
 	}
+	sector = (chunk * chunk_sects) + sect_in_chunk;
 
 	/*
 	 *  real sector = chunk in device + starting of zone
 	 *   + the position in the chunk
 	 */
-    *sector_offset = (chunk * chunk_sects) + sect_in_chunk;
-    s_rdev = raid0_conf->devlist[(zone - raid0_conf->strip_zone) * raid_disks
-								 + sector_div(sector, zone->nb_dev)];
-	s_bdev = s_rdev->bdev;
-	s_disk = s_bdev->bd_disk;
-	nvme_ns = (struct nvme_ns *)s_disk->private_data;
+	rdev = raid0_conf->devlist[(zone - raid0_conf->strip_zone) * raid_disks
+							   + sector_div(sector, zone->nb_dev)];
+	sector += zone->dev_start + rdev->data_offset;
+	*p_sector = sector;
 
-
-#endif
-	return -EINVAL;
+	return (struct nvme_ns *) rdev->bdev->bd_disk->private_data;
 }
-
-
-
-
-
-
-
-
-
-
 
 /*
  * DMA transaction for SSD->GPU asynchronous copy
@@ -1284,7 +1278,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	int					i, base;
 	int					retval;
 
-	total_nbytes = (dtask->nr_blocks << dtask->blocksz_shift);
+	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
 	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
 		return -EINVAL;
 	if (dtask->dest_offset < mgmem->map_offset ||
@@ -1514,23 +1508,23 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 							unsigned int *p_nr_dma_submit,
 							unsigned int *p_nr_dma_blocks)
 {
+	struct inode   *f_inode = filp->f_inode;
 	struct buffer_head	bh;
-	struct nvme_ns	   *nvme_ns;
-	unsigned int		max_nr_blocks
-		= (STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift);
-	unsigned int		nr_blocks;
-	loff_t				curr_offset = dest_offset;
-	int					i, retval = 0;
+	struct nvme_ns *nvme_ns;
+	sector_t		sector;
+	unsigned int	nr_sects;
+	unsigned int	max_nr_sects = (STROM_DMA_SSD2GPU_MAXLEN >> SECTOR_SHIFT);
+	loff_t			curr_offset = dest_offset;
+	int				i, retval = 0;
 
 	for (i=0; i < nr_pages; i++, fpos += PAGE_CACHE_SIZE)
 	{
 		/* lookup the source block number */
 		memset(&bh, 0, sizeof(bh));
-		bh.b_size = dtask->blocksz;
+		bh.b_size = (1UL << f_inode->i_blkbits);
 
-		//inode->i_blkbits??
 		retval = strom_get_block(filp->f_inode,
-								 fpos >> dtask->blocksz_shift,
+								 fpos >> f_inode->i_blkbits,
 								 &bh, 0);
 		if (retval)
 		{
@@ -1538,10 +1532,11 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			break;
 		}
 
-		/* adjust location by table partition */
+		/* adjust location according to sector-size and table partition */
+		sector = bh.b_blocknr >> (f_inode->i_blkbits - SECTOR_SHIFT);
 		if (blkdev->bd_part)
-			bh.b_blocknr += blkdev->bd_part->start_sect;
-		nr_blocks = PAGE_CACHE_SIZE >> dtask->blocksz_shift;
+			sector += blkdev->bd_part->start_sect;
+		nr_sects = PAGE_CACHE_SIZE >> SECTOR_SHIFT;
 
 		/*
 		 * NOTE: If we have MD RAID-0 configuration, block number on the MD
@@ -1555,14 +1550,15 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			struct gendisk *bd_disk = blkdev->bd_disk;
 			struct mddev   *mddev = bd_disk->private_data;
 
-			retval = strom_raid0_map_sector(dtask->raid0_conf,
-											mddev,
-											&nvme_ns,
-											&bh.b_blocknr,
-											&nr_blocks);
-			if (retval)
+			nvme_ns = strom_raid0_map_sector(dtask->raid0_conf,
+											 mddev,
+											 &sector,
+											 nr_sects);
+			if (IS_ERR(nvme_ns))
+			{
+				retval = PTR_ERR(nvme_ns);
 				break;
-			Assert(nvme_ns != NULL);
+			}
 		}
 		else
 		{
@@ -1572,21 +1568,21 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 
 		/* merge with pending request if possible */
 		if ((!nvme_ns || dtask->nvme_ns == nvme_ns) &&
-			dtask->nr_blocks > 0 &&
-			dtask->nr_blocks + nr_blocks <= max_nr_blocks &&
-			dtask->src_block + dtask->nr_blocks == bh.b_blocknr &&
+			dtask->nr_sectors > 0 &&
+			dtask->nr_sectors + nr_sects <= max_nr_sects &&
+			dtask->head_sector + dtask->nr_sectors == sector &&
 			dtask->dest_offset +
-			dtask->nr_blocks * dtask->blocksz == curr_offset)
+			SECTOR_SIZE * dtask->nr_sectors == curr_offset)
 		{
-			dtask->nr_blocks += nr_blocks;
+			dtask->nr_sectors += nr_sects;
 		}
 		else
 		{
 			/* submit pending SSD2GPU DMA */
-			if (dtask->nr_blocks > 0)
+			if (dtask->nr_sectors > 0)
 			{
 				(*p_nr_dma_submit)++;
-				(*p_nr_dma_blocks) += dtask->nr_blocks;
+				(*p_nr_dma_blocks) += dtask->nr_sectors;
 				retval = submit_ssd2gpu_memcpy(dtask);
 				if (retval)
 				{
@@ -1595,8 +1591,8 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 				}
 			}
 			dtask->dest_offset = curr_offset;
-			dtask->src_block = bh.b_blocknr;
-			dtask->nr_blocks = nr_blocks;
+			dtask->head_sector = sector;
+			dtask->nr_sectors  = nr_sects;
 		}
 		curr_offset += PAGE_CACHE_SIZE;
 	}
@@ -1712,10 +1708,10 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 			return retval;
 	}
 	/* submit pending SSD2GPU DMA request, if any */
-	if (dtask->nr_blocks > 0)
+	if (dtask->nr_sectors > 0)
 	{
 		karg->nr_dma_submit++;
-		karg->nr_dma_blocks += dtask->nr_blocks;
+		karg->nr_dma_blocks += dtask->nr_sectors;
 		submit_ssd2gpu_memcpy(dtask);
 	}
 	Assert(karg->nr_ram2gpu + karg->nr_ssd2gpu == karg->nr_chunks);
