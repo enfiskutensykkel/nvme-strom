@@ -157,13 +157,13 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, struct nvme_iod *iod)
 									nvme_ns->lba_shift)) - 1;
 	if (nblocks > 0xffff)
 		return -EINVAL;
-	prDebug("src_block=%zu start_sect=%zu nblocks=%u",
-			(size_t)dtask->src_block,
-			(size_t)dtask->start_sect,
-			nblocks);
+//	prDebug("src_block=%zu start_sect=%zu nblocks=%u",
+//			(size_t)dtask->src_block,
+//			(size_t)dtask->start_sect,
+//			nblocks);
 	slba = dtask->src_block << (dtask->blocksz_shift -
 								nvme_ns->lba_shift);
-	slba += dtask->start_sect;
+//	slba += dtask->start_sect;
 
 	/* setup scatter-gather list */
 	prp_len = __nvme_setup_prps(nvme_ns->dev, iod, length, GFP_KERNEL);

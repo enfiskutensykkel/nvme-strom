@@ -570,37 +570,6 @@ strom_get_block(struct inode *inode, sector_t iblock,
 }
 
 /*
- * strom_nvme_device
- *
- * Representation of the block device underlying the source file.
- * We have two cases supported:
- * 1. File is on a physical NVMe SSD device
- * 2. File is on a logical MD(RAID-0) device that consists of all NVMe-SSD
- */
-struct strom_nvme_raw_device
-{
-	struct nvme_ns *nvme_ns;		/* NVMe SSD namespace (=SCSI LUN) */
-	sector_t		start_sect;		/* first sector of the partition */
-
-	/* parameters for md raid-0 logical device */
-	sector_t		strip_zone_end;	/* @zone_end in strip_zone */
-};
-typedef struct strom_nvme_raw_device	strom_nvme_raw_device;
-
-struct strom_nvme_device
-{
-	int				nr_disks;	/* number of disks in RAID-0 configuration;
-								 * 0 means no RAID configuration, thus, only
-								 * ssd[0] is a valid device in this case. */
-	int				chunk_sectors;	/* unit size of RAID-0 stripe */
-	sector_t		md_start_sect;	/* offset of md-device if /dev/mdX has
-									 * partition table. */
-	struct r0conf  *raid0_conf;	/* MD RAID-0 zone definition */
-	strom_nvme_raw_device ssd[1];	/* flexible length */
-};
-typedef struct strom_nvme_device	strom_nvme_device;
-
-/*
  * ioctl_check_file - checks whether the supplied file descriptor is
  * capable to perform P2P DMA from NVMe SSD.
  * Here are various requirement on filesystem / devices.
@@ -618,11 +587,9 @@ typedef struct strom_nvme_device	strom_nvme_device;
  * __extblock_is_supported_nvme - checker for BLOCK_EXT_MAJOR
  */
 static int
-__extblock_is_supported_nvme(struct block_device *blkdev,
-							 struct nvme_ns **p_nvme_ns)
+__extblock_is_supported_nvme(struct block_device *blkdev)
 {
 	struct gendisk *bd_disk = blkdev->bd_disk;
-	struct nvme_ns *nvme_ns = (struct nvme_ns *)bd_disk->private_data;
 	const char	   *dname;
 	int				rc;
 
@@ -674,11 +641,7 @@ __extblock_is_supported_nvme(struct block_device *blkdev,
 				bd_disk->disk_name, rc);
 		return -ENOTSUPP;
 	}
-
-	/* OK, we assume the underlying device is supported NVMe-SSD */
-	if (p_nvme_ns)
-		*p_nvme_ns = nvme_ns;
-	return 0;
+	return 0;	/* OK, we can assume this volume is raw NVMe-SSD */
 }
 
 /*
@@ -686,13 +649,12 @@ __extblock_is_supported_nvme(struct block_device *blkdev,
  */
 static int
 __mdblock_is_supported_nvme(struct block_device *blkdev,
-							strom_nvme_device **p_nvme_dev)
+							struct r0conf **p_raid0_conf)
 {
 	struct gendisk *bd_disk = blkdev->bd_disk;
 	const char	   *dname;
 	struct mddev   *mddev;
 	struct md_rdev *rdev;
-	strom_nvme_device *nvme_dev = NULL;
 	int				rc;
 
 	/* 'md' logical RAID volume is expected */
@@ -725,6 +687,17 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	 * check md-raid configuration parameters
 	 */
 	mddev = bd_disk->private_data;
+
+	prNotice("mddev {chunk_sectors=%lu level=%d layout=%d raid_disks=%d max_disks=%d dev_sectors=%lu array_sectors=%lu}",
+			 (long)mddev->chunk_sectors,
+			 mddev->level,
+			 mddev->layout,
+			 mddev->raid_disks,
+			 mddev->max_disks,
+			 (long)mddev->dev_sectors,
+			 (long)mddev->array_sectors);
+
+
 	if (!mddev || !mddev->pers || !mddev->ready)
 	{
 		prError("md-device '%s' is not ready to handle i/o",
@@ -732,18 +705,12 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 		return -ENOTSUPP;
 	}
 
-	// TODO: If mddev->suspended, we may need a loop like
-	// md_make_request, or simply abort.
-	// we don't need to care about 'ro'
-
-
 	if (mddev->raid_disks == 0)
 	{
 		prError("md-device '%s' contains no underlying disks",
 				bd_disk->disk_name);
 		return -ENOTSUPP;
 	}
-	prNotice("raid_disks = %d", mddev->raid_disks);
 
 	if (mddev->level != 0 || mddev->layout != 0)
 	{
@@ -760,45 +727,31 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 		return -ENOTSUPP;
 	}
 
-	if (p_nvme_dev)
-	{
-		nvme_dev = kzalloc(offsetof(strom_nvme_device,
-									ssd[mddev->raid_disks]), GFP_KERNEL);
-		if (!nvme_dev)
-			return -ENOMEM;
-		nvme_dev->nr_disks = mddev->raid_disks;
-		nvme_dev->chunk_sectors = mddev->chunk_sectors;
-		/* 'mdXX' device has partition table? */
-		if (blkdev->bd_part)
-			nvme_dev->md_start_sect = blkdev->bd_part->start_sect;
-		nvme_dev->raid0_conf = mddev->private;
-	}
-
 	/* check for each underlying devices */
 	rdev_for_each(rdev, mddev)
 	{
-		struct block_device	*s_bdev = rdev->bdev;
-		struct gendisk		*s_disk = s_bdev->bd_disk;
+		prNotice("rdev[%d]{bd_block_size=%u part{start_sect=%ld nr_sects=%ld}}",
+				 rdev->desc_nr,
+				 rdev->bdev->bd_block_size,
+				 rdev->bdev->bd_part ? (long)rdev->bdev->bd_part->start_sect : 0L,
+				 rdev->bdev->bd_part ? (long)rdev->bdev->bd_part->nr_sects : 0L);
+	}
 
-		rc = __extblock_is_supported_nvme(s_bdev, NULL);
+	rdev_for_each(rdev, mddev)
+	{
+		rc = __extblock_is_supported_nvme(rdev->bdev);
 		if (rc)
 		{
 			prError("md-device '%s' - disk[%d] is not NVMe-SSD",
 					bd_disk->disk_name, rdev->desc_nr);
-			kfree(nvme_dev);
 			return rc;
 		}
-		Assert(rdev->desc_nr < mddev->raid_disks);
-		if (nvme_dev)
-		{
-			strom_nvme_raw_device *ssd = &nvme_dev->ssd[rdev->desc_nr];
-
-			ssd->nvme_ns = (struct nvme_ns *)s_disk->private_data;
-			ssd->start_sect = (s_bdev->bd_part ?
-							   s_bdev->bd_part->start_sect : 0);
-
-		}
 	}
+
+	/* ok, MD RAID-0 volume consists of all NVMe-SSD devices */
+	if (p_raid0_conf)
+		*p_raid0_conf = mddev->private;
+
 	return -ENOTSUPP;
 }
 
@@ -807,13 +760,21 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
  */
 static int
 file_is_supported_nvme(struct file *filp, bool is_writable,
-					   struct nvme_ns **p_nvme_ns)
+					   struct r0conf **p_raid0_conf)
 {
 	struct inode	   *f_inode = filp->f_inode;
 	struct super_block *i_sb = f_inode->i_sb;
 	struct file_system_type *s_type = i_sb->s_type;
 	struct block_device *s_bdev = i_sb->s_bdev;
 	struct gendisk	   *bd_disk = s_bdev->bd_disk;
+
+	prNotice("f_inode {i_bytes=%d i_blkbits=%d}", (int)f_inode->i_bytes, (int)f_inode->i_blkbits);
+	prNotice("i_sb {s_blocksize_bits=%d s_blocksize=%d}", (int)i_sb->s_blocksize_bits, (int)i_sb->s_blocksize);
+	prNotice("s_bdev->bd_part = %p {start_sect=%lu nr_sects=%lu bd_block_size=%u}",
+			 s_bdev->bd_part,
+			 (long)s_bdev->bd_part->start_sect,
+			 (long)s_bdev->bd_part->nr_sects,
+			 s_bdev->bd_block_size);
 
 	/*
 	 * must have proper permission to the target file
@@ -887,9 +848,9 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	 * 2. logical MD RAID-0 device which consists of only NVMe-SSDs
 	 */
 	if (bd_disk->major == BLOCK_EXT_MAJOR)
-		return __extblock_is_supported_nvme(s_bdev, p_nvme_ns);
+		return __extblock_is_supported_nvme(s_bdev);
 	else if (bd_disk->major == MD_MAJOR)
-		return __mdblock_is_supported_nvme(s_bdev, NULL);
+		return __mdblock_is_supported_nvme(s_bdev, p_raid0_conf);
 
 	prError("block device '%s' on behalf of the file is not supported",
 			bd_disk->disk_name);
@@ -950,9 +911,11 @@ struct strom_dma_task
 	size_t				blocksz;	/* blocksize of the filesystem */
 	int					blocksz_shift;	/* log2 of 'blocksz' */
 
+	/* MD RAID-0 configuration, if any */
+	struct r0conf	   *raid0_conf;
+	/* current focus of the raw NVMe-SSD device */
 	struct nvme_ns	   *nvme_ns;	/* NVMe namespace (=SCSI LUN) */
-	sector_t			start_sect;	/* first sector of the source partition */
-	sector_t			nr_sects;	/* number of sectors of the partition */
+//	sector_t			start_sect;	/* first sector of the source partition */
 
 	/*
 	 * status of asynchronous tasks
@@ -1011,7 +974,7 @@ strom_create_dma_task(unsigned long handle,
 	struct file			   *filp;
 	struct super_block	   *i_sb;
 	struct block_device	   *s_bdev;
-	struct nvme_ns		   *nvme_ns;
+	struct r0conf		   *raid0_conf = NULL;
 	long					retval;
 	unsigned long			flags;
 
@@ -1024,7 +987,7 @@ strom_create_dma_task(unsigned long handle,
 		retval = -EBADF;
 		goto error_0;
 	}
-	retval = file_is_supported_nvme(filp, false, &nvme_ns);
+	retval = file_is_supported_nvme(filp, false, &raid0_conf);
 	if (retval < 0)
 		goto error_1;
 	i_sb = filp->f_inode->i_sb;
@@ -1051,17 +1014,30 @@ strom_create_dma_task(unsigned long handle,
 	dtask->frozen		= false;
     dtask->mgmem		= mgmem;
     dtask->filp			= filp;
-	dtask->nvme_ns		= nvme_ns;
+	dtask->raid0_conf	= raid0_conf;
+	dtask->nvme_ns		= NULL;		/* to be set later */
+//	dtask->start_sect	= 0;		/* to be set later */
 	dtask->blocksz		= i_sb->s_blocksize;
 	dtask->blocksz_shift = i_sb->s_blocksize_bits;
 	Assert(dtask->blocksz == (1UL << dtask->blocksz_shift));
-	dtask->start_sect	= s_bdev->bd_part->start_sect;
-	dtask->nr_sects		= s_bdev->bd_part->nr_sects;
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
 	dtask->dest_offset	= 0;
 	dtask->src_block	= 0;
 	dtask->nr_blocks	= 0;
+
+	/*
+	 * If no MD RAID-0 configuration here, the focused NVMe-SSD will not be
+	 * changed during execution. So, we setup nvme_ns here.
+	 */
+	if (!raid0_conf)
+	{
+		struct gendisk	   *bd_disk = s_bdev->bd_disk;
+
+		dtask->nvme_ns	= (struct nvme_ns *)bd_disk->private_data;
+//		if (s_bdev->bd_part)
+//			dtask->start_sect = s_bdev->bd_part->start_sect;
+	}
 
 	/* OK, this strom_dma_task is now tracked */
 	spin_lock_irqsave(&strom_dma_task_locks[dtask->hindex], flags);
@@ -1151,6 +1127,102 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 	else if (has_spinlock)
 		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
 }
+
+/*
+ * MD RAID-0 Support
+ *
+ *
+ *
+ *
+ *
+ *
+ */
+static inline struct strip_zone *
+find_zone(struct r0conf *conf, sector_t *p_sector)
+{
+	struct strip_zone  *zone = conf->strip_zone;
+	sector_t			sector = *p_sector;
+	int					i;
+
+	for (i = 0; i < conf->nr_strip_zones; i++)
+	{
+		if (sector < zone[i].zone_end) {
+			if (i)
+				*p_sector = sector - zone[i-1].zone_end;
+			return zone + i;
+		}
+	}
+	return NULL;
+}
+
+static int
+strom_raid0_map_sector(struct r0conf *raid0_conf,
+					   struct mddev *mddev,
+					   struct nvme_ns **p_nvme_ns,
+					   sector_t *p_block_pos,
+					   unsigned int *p_nr_blocks)
+{
+#if 0
+	struct strip_zone  *zone;
+	struct nvme_ns	   *nvme_ns;
+	sector_t			sector = *p_block_pos;
+	unsigned int		nr_blocks = *p_nr_blocks;
+	unsigned int		sect_in_chunk;
+	sector_t			chunk;
+	int					raid_disks = raid0_conf->strip_zone[0].nb_dev;
+	unsigned int		chunk_sects = mddev->chunk_sectors;
+
+	zone = find_zone(raid0_conf, sector);
+	if (!zone)
+	{
+		prError("sector='%lu': out of range in md raid-0 configuration",
+				sector);
+		return -ERANGE;
+	}
+
+	if ((chunk_sects & (chunk_sects - 1)) == 0)		/* power of 2? */
+	{
+		int			chunksect_bits = ffz(~chunk_sects);
+		/* find the sector offset inside the chunk */
+		sect_in_chunk = sector & (chunk_sects - 1);
+		sector >>= chunksect_bits;
+		/* chunk in zone */
+		chunk = *sector_offset;
+		/* quotient is the chunk in real device*/
+		sector_div(chunk, zone->nb_dev << chunksect_bits);
+	}
+	else
+	{
+		sect_in_chunk = sector_div(sector, chunk_sects);
+		chunk = *sector_offset;
+		sector_div(chunk, chunk_sects * zone->nb_dev);
+	}
+
+	/*
+	 *  real sector = chunk in device + starting of zone
+	 *   + the position in the chunk
+	 */
+    *sector_offset = (chunk * chunk_sects) + sect_in_chunk;
+    s_rdev = raid0_conf->devlist[(zone - raid0_conf->strip_zone) * raid_disks
+								 + sector_div(sector, zone->nb_dev)];
+	s_bdev = s_rdev->bdev;
+	s_disk = s_bdev->bd_disk;
+	nvme_ns = (struct nvme_ns *)s_disk->private_data;
+
+
+#endif
+	return -EINVAL;
+}
+
+
+
+
+
+
+
+
+
+
 
 /*
  * DMA transaction for SSD->GPU asynchronous copy
@@ -1372,11 +1444,11 @@ ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
  */
 static int
 __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
-						   int nr_pages,
+						   struct file *filp,
 						   loff_t fpos,
+						   int nr_pages,
 						   char __user *dest_uaddr)
 {
-	struct file	   *filp = dtask->filp;
 	struct page	   *fpage;
 	char		   *kaddr;
 	pgoff_t			fp_index = fpos >> PAGE_CACHE_SHIFT;
@@ -1434,14 +1506,16 @@ __memcpy_ssd2gpu_writeback(strom_dma_task *dtask,
  */
 static int
 __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
-							int nr_pages,
+							struct file *filp,
+							struct block_device *blkdev,
 							loff_t fpos,
+							int nr_pages,
 							loff_t dest_offset,
 							unsigned int *p_nr_dma_submit,
 							unsigned int *p_nr_dma_blocks)
 {
-	struct file		   *filp = dtask->filp;
 	struct buffer_head	bh;
+	struct nvme_ns	   *nvme_ns;
 	unsigned int		max_nr_blocks
 		= (STROM_DMA_SSD2GPU_MAXLEN >> dtask->blocksz_shift);
 	unsigned int		nr_blocks;
@@ -1454,6 +1528,7 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 		memset(&bh, 0, sizeof(bh));
 		bh.b_size = dtask->blocksz;
 
+		//inode->i_blkbits??
 		retval = strom_get_block(filp->f_inode,
 								 fpos >> dtask->blocksz_shift,
 								 &bh, 0);
@@ -1462,10 +1537,42 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 			prError("strom_get_block: %d", retval);
 			break;
 		}
+
+		/* adjust location by table partition */
+		if (blkdev->bd_part)
+			bh.b_blocknr += blkdev->bd_part->start_sect;
 		nr_blocks = PAGE_CACHE_SIZE >> dtask->blocksz_shift;
 
+		/*
+		 * NOTE: If we have MD RAID-0 configuration, block number on the MD
+		 * device shall be remapped to the block number on the raw NVMe-SSD
+		 * here.
+		 * The logic to map block number is equivalent to find_zone() and
+		 * map_sector() at drivers/md/raid0.c.
+		 */
+		if (dtask->raid0_conf)
+		{
+			struct gendisk *bd_disk = blkdev->bd_disk;
+			struct mddev   *mddev = bd_disk->private_data;
+
+			retval = strom_raid0_map_sector(dtask->raid0_conf,
+											mddev,
+											&nvme_ns,
+											&bh.b_blocknr,
+											&nr_blocks);
+			if (retval)
+				break;
+			Assert(nvme_ns != NULL);
+		}
+		else
+		{
+			/* case of raw NVMe-SSD device */
+			nvme_ns = NULL;
+		}
+
 		/* merge with pending request if possible */
-		if (dtask->nr_blocks > 0 &&
+		if ((!nvme_ns || dtask->nvme_ns == nvme_ns) &&
+			dtask->nr_blocks > 0 &&
 			dtask->nr_blocks + nr_blocks <= max_nr_blocks &&
 			dtask->src_block + dtask->nr_blocks == bh.b_blocknr &&
 			dtask->dest_offset +
@@ -1505,15 +1612,18 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 						 uint32_t *chunk_ids_in,
 						 uint32_t *chunk_ids_out)
 {
-	mapped_gpu_memory *mgmem = dtask->mgmem;
-	struct file	   *filp = dtask->filp;
-	char __user	   *dest_uaddr;
-	size_t			dest_offset;
-	unsigned int	nr_pages = (karg->chunk_sz >> PAGE_CACHE_SHIFT);
-	int				threshold = nr_pages / 2;
-	size_t			i_size;
-	int				retval = 0;
-	int				i, j, k;
+	mapped_gpu_memory  *mgmem = dtask->mgmem;
+	struct file		   *filp = dtask->filp;
+	struct inode	   *f_inode = filp->f_inode;
+	struct super_block *i_sb = f_inode->i_sb;
+	struct block_device	*blkdev = i_sb->s_bdev;
+	char __user		   *dest_uaddr;
+	size_t				dest_offset;
+	unsigned int		nr_pages = (karg->chunk_sz >> PAGE_CACHE_SHIFT);
+	int					threshold = nr_pages / 2;
+	size_t				i_size;
+	int					retval = 0;
+	int					i, j, k;
 
 	/* sanity checks */
 	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
@@ -1559,8 +1669,9 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 			dest_uaddr = karg->wb_buffer +
 				karg->chunk_sz * (karg->nr_chunks - karg->nr_ram2gpu);
 			retval = __memcpy_ssd2gpu_writeback(dtask,
-												nr_pages,
+												filp,
 												fpos,
+												nr_pages,
 												dest_uaddr);
 			chunk_ids_out[karg->nr_chunks -
 						  karg->nr_ram2gpu] = (uint32_t)chunk_id;
@@ -1568,8 +1679,10 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 		else
 		{
 			retval = __memcpy_ssd2gpu_submit_dma(dtask,
-												 nr_pages,
+												 filp,
+												 blkdev,
 												 fpos,
+												 nr_pages,
 												 dest_offset,
 												 &karg->nr_dma_submit,
 												 &karg->nr_dma_blocks);
