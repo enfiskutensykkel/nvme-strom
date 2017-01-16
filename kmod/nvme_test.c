@@ -130,6 +130,69 @@ ioctl_map_gpu_memory(CUdeviceptr cuda_devptr, size_t buffer_size)
 	return uarg.handle;
 }
 
+static void
+memdump_on_corruption(const char *src_buffer,
+					  const char *dst_buffer,
+					  size_t total_length)
+{
+	long	unitsz = 16;
+	long	pos;
+	int		enable_dump = 0;
+	int		i;
+
+	for (pos=0; pos < total_length; pos += unitsz)
+	{
+		const char *src_ptr = src_buffer + pos;
+		const char *dst_ptr = dst_buffer + pos;
+
+		if (memcmp(src_ptr, dst_ptr, unitsz) != 0)
+		{
+			if (!enable_dump)
+			{
+				enable_dump = 1;
+				total_length = Min(total_length, pos + 8 * unitsz);
+				pos = Max(pos - 4 * unitsz, -unitsz);
+				continue;
+			}
+			printf("- 0x%08lx ", (long)pos);
+			for (i=0; i < unitsz; i++)
+			{
+				if (i == unitsz / 2)
+					putchar(' ');
+				printf(" %02x", (int)(src_ptr[i] & 0xff));
+			}
+			putchar('\n');
+			printf("+ 0x%08lx ", (long)pos);
+			for (i=0; i < unitsz; i++)
+			{
+				if (i == unitsz / 2)
+					putchar(' ');
+				printf(" %02x", (int)(dst_ptr[i] & 0xff));
+			}
+			putchar('\n');
+		}
+		else if (enable_dump)
+		{
+			printf("  0x%08lx ", (long)pos);
+			for (i=0; i < unitsz; i++)
+			{
+				if (i == unitsz / 2)
+					putchar(' ');
+				printf(" %02x", (int)(src_ptr[i] & 0xff));
+			}
+			putchar('\n');
+		}
+	}
+
+
+
+
+
+
+	fprintf(stderr, "memory corruption detected\n");
+	exit(1);
+}
+
 typedef struct
 {
 	loff_t			fpos;
@@ -174,7 +237,9 @@ callback_release_atask(CUstream cuda_stream, CUresult status, void *private)
 		if (memcmp(atask->src_buffer,
 				   atask->dest_buffer,
 				   segment_sz) != 0)
-			system_exit_on_error(1, "memcmp");
+			memdump_on_corruption(atask->src_buffer,
+								  atask->dest_buffer,
+								  segment_sz);
 	}
 	else
 	{
@@ -193,8 +258,10 @@ callback_release_atask(CUstream cuda_stream, CUresult status, void *private)
 					   atask->dest_buffer + j * BLCKSZ,
 					   BLCKSZ) != 0)
 			{
-				printf("i=%d j=%d\n", i, j);
-				system_exit_on_error(1, "memcmp");
+				fprintf(stderr, "i=%d j=%d\n", i, j);
+				memdump_on_corruption(atask->src_buffer + i * BLCKSZ,
+									  atask->dest_buffer + j * BLCKSZ,
+									  BLCKSZ);
 			}
 		}
 	}

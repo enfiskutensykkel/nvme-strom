@@ -698,16 +698,6 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	 */
 	mddev = bd_disk->private_data;
 
-	prNotice("mddev {chunk_sectors=%lu level=%d layout=%d raid_disks=%d max_disks=%d dev_sectors=%lu array_sectors=%lu}",
-			 (long)mddev->chunk_sectors,
-			 mddev->level,
-			 mddev->layout,
-			 mddev->raid_disks,
-			 mddev->max_disks,
-			 (long)mddev->dev_sectors,
-			 (long)mddev->array_sectors);
-
-
 	if (!mddev || !mddev->pers || !mddev->ready)
 	{
 		prError("md-device '%s' is not ready to handle i/o",
@@ -740,15 +730,6 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	/* check for each underlying devices */
 	rdev_for_each(rdev, mddev)
 	{
-		prNotice("rdev[%d]{bd_block_size=%u part{start_sect=%ld nr_sects=%ld}}",
-				 rdev->desc_nr,
-				 rdev->bdev->bd_block_size,
-				 rdev->bdev->bd_part ? (long)rdev->bdev->bd_part->start_sect : 0L,
-				 rdev->bdev->bd_part ? (long)rdev->bdev->bd_part->nr_sects : 0L);
-	}
-
-	rdev_for_each(rdev, mddev)
-	{
 		rc = __extblock_is_supported_nvme(rdev->bdev);
 		if (rc)
 		{
@@ -777,14 +758,6 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	struct file_system_type *s_type = i_sb->s_type;
 	struct block_device *s_bdev = i_sb->s_bdev;
 	struct gendisk	   *bd_disk = s_bdev->bd_disk;
-
-	prNotice("f_inode {i_bytes=%d i_blkbits=%d}", (int)f_inode->i_bytes, (int)f_inode->i_blkbits);
-	prNotice("i_sb {s_blocksize_bits=%d s_blocksize=%d}", (int)i_sb->s_blocksize_bits, (int)i_sb->s_blocksize);
-	prNotice("s_bdev->bd_part = %p {start_sect=%lu nr_sects=%lu bd_block_size=%u}",
-			 s_bdev->bd_part,
-			 (long)s_bdev->bd_part->start_sect,
-			 (long)s_bdev->bd_part->nr_sects,
-			 s_bdev->bd_block_size);
 
 	/*
 	 * must have proper permission to the target file
@@ -1164,6 +1137,7 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 	struct strip_zone  *zone;
 	struct md_rdev	   *rdev;
 	sector_t			sector = *p_sector;
+	sector_t			sector_offset = sector;
 	sector_t			chunk;
 	unsigned int		sect_in_chunk;
 	int					raid_disks = raid0_conf->strip_zone[0].nb_dev;
@@ -1173,15 +1147,15 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 	 * Ensure (sector)...(sector + nr_sects) does not go across the chunk
 	 * boundary.
 	 */
-	if (sector / chunk_sects != (sector + nr_sects) / chunk_sects)
+	if (sector / chunk_sects != (sector + nr_sects - 1) / chunk_sects)
 	{
 		prError("Bug? page-aligned i/o goes across boundary of md raid-0"
 				" (sector=%ld, nr_sect=%u, chunk_sects=%ld)",
 				(long)sector, nr_sects, (long)chunk_sects);
 		return ERR_PTR(-ESPIPE);
 	}
-
-	zone = find_zone(raid0_conf, &sector);
+ 
+	zone = find_zone(raid0_conf, &sector_offset);
 	if (!zone)
 	{
 		prError("sector='%lu': out of range in md raid-0 configuration",
@@ -1189,7 +1163,6 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 		return ERR_PTR(-ERANGE);
 	}
 
-	chunk = sector;
 	if ((chunk_sects & (chunk_sects - 1)) == 0)		/* power of 2? */
 	{
 		int			chunksect_bits = ffz(~chunk_sects);
@@ -1197,14 +1170,16 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 		sect_in_chunk = sector & (chunk_sects - 1);
 		sector >>= chunksect_bits;
 		/* chunk in zone; quotient is the chunk in real device*/
+		chunk = sector_offset;
 		sector_div(chunk, zone->nb_dev << chunksect_bits);
 	}
 	else
 	{
 		sect_in_chunk = sector_div(sector, chunk_sects);
+		chunk = sector_offset;
 		sector_div(chunk, chunk_sects * zone->nb_dev);
 	}
-	sector = (chunk * chunk_sects) + sect_in_chunk;
+	sector_offset = (chunk * chunk_sects) + sect_in_chunk;
 
 	/*
 	 *  real sector = chunk in device + starting of zone
@@ -1212,8 +1187,11 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 	 */
 	rdev = raid0_conf->devlist[(zone - raid0_conf->strip_zone) * raid_disks
 							   + sector_div(sector, zone->nb_dev)];
-	sector += zone->dev_start + rdev->data_offset;
-	*p_sector = sector;
+
+	sector_offset += zone->dev_start + rdev->data_offset;
+	if (rdev->bdev->bd_part)
+		sector_offset += rdev->bdev->bd_part->start_sect;
+	*p_sector = sector_offset;
 
 	return (struct nvme_ns *) rdev->bdev->bd_disk->private_data;
 }
@@ -1269,7 +1247,6 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
-	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
 	struct nvme_iod	   *iod;
 	size_t				offset;
 	size_t				total_nbytes;
@@ -1277,6 +1254,9 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	int					length;
 	int					i, base;
 	int					retval;
+
+	/* sanity checks */
+	Assert(nvme_ns != NULL);
 
 	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
 	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
@@ -1288,7 +1268,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	iod = nvme_alloc_iod(total_nbytes,
 						 mgmem,
-						 nvme_dev,
+						 nvme_ns->dev,
 						 GFP_KERNEL);
 	if (!iod)
 		return -ENOMEM;
@@ -1317,7 +1297,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	if (total_nbytes)
 	{
-		__nvme_free_iod(nvme_dev, iod);
+		__nvme_free_iod(nvme_ns->dev, iod);
 		return -EINVAL;
 	}
 	sg_mark_end(&iod->sg[i]);
@@ -1325,7 +1305,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	retval = nvme_submit_async_read_cmd(dtask, iod);
 	if (retval)
-		__nvme_free_iod(nvme_dev, iod);
+		__nvme_free_iod(nvme_ns->dev, iod);
 
 	return retval;
 }
@@ -1533,7 +1513,7 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 		}
 
 		/* adjust location according to sector-size and table partition */
-		sector = bh.b_blocknr >> (f_inode->i_blkbits - SECTOR_SHIFT);
+		sector = bh.b_blocknr << (f_inode->i_blkbits - SECTOR_SHIFT);
 		if (blkdev->bd_part)
 			sector += blkdev->bd_part->start_sect;
 		nr_sects = PAGE_CACHE_SIZE >> SECTOR_SHIFT;
@@ -1590,6 +1570,8 @@ __memcpy_ssd2gpu_submit_dma(strom_dma_task *dtask,
 					break;
 				}
 			}
+			if (nvme_ns != NULL)
+				dtask->nvme_ns = nvme_ns;
 			dtask->dest_offset = curr_offset;
 			dtask->head_sector = sector;
 			dtask->nr_sectors  = nr_sects;
