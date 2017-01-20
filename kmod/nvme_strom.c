@@ -1798,6 +1798,7 @@ ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
 {
 	StromCmd__DebugCommand	karg;
 	struct file			   *filp;
+	struct gendisk		   *bd_disk;
 	struct nvme_ns		   *nvme_ns;
 	struct nvme_dev		   *nvme_dev;
 	struct dma_pool		   *pool;
@@ -1825,7 +1826,8 @@ ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
 				karg.file_desc, current->tgid);
 		goto out;
 	}
-	nvme_ns = (struct nvme_ns *)filp->f_inode->i_sb->s_bdev->bd_disk;
+	bd_disk = filp->f_inode->i_sb->s_bdev->bd_disk;
+	nvme_ns = (struct nvme_ns *) bd_disk->private_data;
 	nvme_dev = nvme_ns->dev;
 
 	pool = nvme_dev->prp_page_pool;
@@ -1838,7 +1840,7 @@ ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
 	spin_lock_irqsave(&pool->lock, flags);
 	list_for_each_entry(page, &pool->page_list, page_list)
 		small_count++;
-    spin_unlock_irqrestore(&pool->lock, flags);
+	spin_unlock_irqrestore(&pool->lock, flags);
 
 	karg.values[0] = page_count;
 	karg.values[1] = small_count;
