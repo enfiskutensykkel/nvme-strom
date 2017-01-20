@@ -1770,6 +1770,86 @@ out:
 	return retval;
 }
 
+/*
+ * STROM_IOCTL__DEBUG_COMMAND
+ */
+
+struct dma_pool {       /* the pool */
+    struct list_head page_list;
+    spinlock_t lock;
+    size_t size;
+    struct device *dev;
+    size_t allocation;
+    size_t boundary;
+    char name[32];
+    struct list_head pools;
+};
+
+struct dma_page {       /* cacheable header for 'allocation' bytes */
+    struct list_head page_list;
+    void *vaddr;
+    dma_addr_t dma;
+    unsigned int in_use;
+    unsigned int offset;
+};
+
+static int
+ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
+{
+	StromCmd__DebugCommand	karg;
+	struct file			   *filp;
+	struct nvme_ns		   *nvme_ns;
+	struct nvme_dev		   *nvme_dev;
+	struct dma_pool		   *pool;
+	struct dma_page		   *page;
+	struct r0conf		   *raid0conf = NULL;
+	int						page_count = 0;
+	int						small_count = 0;
+	unsigned long			flags;
+	int						retval;
+
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__DebugCommand)))
+		return -EFAULT;
+
+	filp = fget(karg.file_desc);
+	if (!filp)
+	{
+		prError("file descriptor %d of process %u is not available",
+				karg.file_desc, current->tgid);
+		return -EBADF;
+	}
+	retval = file_is_supported_nvme(filp, false, &raid0conf);
+	if (retval < 0 || raid0conf != NULL)
+	{
+		prError("file descriptor %d of process %u is not supported",
+				karg.file_desc, current->tgid);
+		goto out;
+	}
+	nvme_ns = (struct nvme_ns *)filp->f_inode->i_sb->s_bdev->bd_disk;
+	nvme_dev = nvme_ns->dev;
+
+	pool = nvme_dev->prp_page_pool;
+	spin_lock_irqsave(&pool->lock, flags);
+	list_for_each_entry(page, &pool->page_list, page_list)
+		page_count++;
+	spin_unlock_irqrestore(&pool->lock, flags);
+
+	pool = nvme_dev->prp_small_pool;
+	spin_lock_irqsave(&pool->lock, flags);
+	list_for_each_entry(page, &pool->page_list, page_list)
+		small_count++;
+    spin_unlock_irqrestore(&pool->lock, flags);
+
+	karg.values[0] = page_count;
+	karg.values[1] = small_count;
+
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__DebugCommand)))
+		retval = -EFAULT;
+out:
+	fput(filp);
+	return retval;
+}
+
 /* ================================================================
  *
  * file_operations of '/proc/nvme-strom' entry
@@ -1870,6 +1950,10 @@ strom_proc_ioctl(struct file *ioctl_filp,
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
 											   ioctl_filp);
+			break;
+
+		case STROM_IOCTL__DEBUG_COMMAND:
+			retval = ioctl_debug_command((void __user *) arg);
 			break;
 
 		default:

@@ -42,6 +42,7 @@ static size_t	segment_sz = 32UL << 20;
 static int		enable_checks = 0;
 static int		print_mapping = 0;
 static int		test_by_vfs = 0;
+static int		debug_command = 0;
 static size_t	vfs_io_size = 0;
 
 static sem_t	buffer_sem;
@@ -684,6 +685,41 @@ static int ioctl_print_gpu_memory(void)
 }
 
 /*
+ * debug command
+ */
+static int
+ioctl_debug_command(int file_desc)
+{
+	StromCmd__DebugCommand cmd;
+	int			rc;
+
+	memset(&cmd, 0, sizeof(StromCmd__DebugCommand));
+	cmd.file_desc		= file_desc;
+
+	rc = nvme_strom_ioctl(STROM_IOCTL__DEBUG_COMMAND, &cmd);
+	system_exit_on_error(rc, "ioctl");
+
+	printf("STROM_IOCTL__DEBUG results:\n"
+		   "  values[0] = %lu\n"
+		   "  values[1] = %lu\n"
+		   "  values[2] = %lu\n"
+		   "  values[3] = %lu\n"
+		   "  values[4] = %lu\n"
+		   "  values[5] = %lu\n"
+		   "  values[6] = %lu\n"
+		   "  values[7] = %lu\n",
+		   cmd.values[0],
+		   cmd.values[1],
+		   cmd.values[2],
+		   cmd.values[3],
+		   cmd.values[4],
+		   cmd.values[5],
+		   cmd.values[6],
+		   cmd.values[7]);
+	return 0;
+}
+
+/*
  * usage
  */
 static void usage(const char *cmdname)
@@ -719,7 +755,7 @@ int main(int argc, char * const argv[])
 	char			devname[256];
 	int				code;
 
-	while ((code = getopt(argc, argv, "d:n:s:cpf::h")) >= 0)
+	while ((code = getopt(argc, argv, "d:n:s:cpf::gh")) >= 0)
 	{
 		switch (code)
 		{
@@ -742,6 +778,9 @@ int main(int argc, char * const argv[])
 				test_by_vfs = 1;
 				if (optarg)
 					vfs_io_size = (size_t)atoi(optarg) << 10;
+				break;
+			case 'g':
+				debug_command = 1;
 				break;
 			case 'h':
 			default:
@@ -776,6 +815,10 @@ int main(int argc, char * const argv[])
 		fprintf(stderr, "failed to open \"%s\": %m\n", filename);
 		return 1;
 	}
+
+	/* try to get file property */
+	if (debug_command)
+		return ioctl_debug_command(fdesc);
 
 	if (fstat(fdesc, &stbuf) != 0)
 	{
