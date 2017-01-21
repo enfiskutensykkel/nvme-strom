@@ -300,8 +300,10 @@ ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 	unsigned long		map_offset;
 	unsigned long		handle;
 	unsigned long		flags;
+	uint64_t			curr_paddr;
+	uint64_t			next_paddr;
 	uint32_t			entries;
-	int					rc;
+	int					i, rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
 		return -EFAULT;
@@ -356,6 +358,20 @@ ioctl_map_gpu_memory(StromCmd__MapGpuMemory __user *uarg)
 		default:
 			rc = -EINVAL;
 			goto error_2;
+	}
+
+	/* ensure mapped physical addresses are continuous */
+	curr_paddr = mgmem->page_table->pages[0]->physical_address;
+	for (i=1; i < mgmem->page_table->entries; i++)
+	{
+		next_paddr = mgmem->page_table->pages[i]->physical_address;
+		if (curr_paddr + mgmem->gpu_page_sz != next_paddr)
+		{
+			prError("Mapped P2P GPU Memory was no continuous");
+			rc = -EINVAL;
+			goto error_2;
+		}
+		curr_paddr = next_paddr;
 	}
 
 	/* return the handle of mapped_gpu_memory */
@@ -1212,9 +1228,7 @@ struct strom_prps_item
 {
 	struct list_head	chain;
 	struct nvme_dev	   *nvme_dev;
-	dma_addr_t			this_paddr;
-	/* below is fields for PRPs list */
-	dma_addr_t			first_dma;
+	dma_addr_t			pitem_dma;	/* physical address of this structure */
 	unsigned int		nrooms;	/* size of prps_list[] array */
 	unsigned int		nitems;	/* usage count of prps_list[] array */
 	__le64				prps_list[0];
@@ -1267,7 +1281,7 @@ strom_prps_items_release(struct nvme_dev *nvme_dev)
 				dma_free_coherent(&nvme_dev->pci_dev->dev,
 								  length,
 								  pitem,
-								  pitem->this_paddr);
+								  pitem->pitem_dma);
 			}
 		}
 		spin_unlock_irqrestore(lock, flags);
@@ -1281,9 +1295,9 @@ strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
 	spinlock_t		   *lock = &strom_prps_locks[index];
 	struct list_head   *slot = &strom_prps_slots[index];
 	unsigned long		flags;
+	dma_addr_t			pitem_dma;
 	unsigned int		nrooms;
 	size_t				length;
-	dma_addr_t			this_paddr;
 	strom_prps_item	   *pitem;
 
 	spin_lock_irqsave(lock, flags);
@@ -1306,14 +1320,13 @@ strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
 	length = offsetof(strom_prps_item, prps_list[nrooms]);
 	pitem = dma_alloc_coherent(&nvme_dev->pci_dev->dev,
 							   length,
-							   &this_paddr,
+							   &pitem_dma,
 							   GFP_KERNEL);
 	if (!pitem)
 		return NULL;
 
 	pitem->nvme_dev = nvme_dev;
-	pitem->this_paddr = this_paddr;
-	pitem->first_dma = 0UL;
+	pitem->pitem_dma = pitem_dma;
 	pitem->nrooms = nrooms;
 	pitem->nitems = 0;
 
@@ -1350,41 +1363,7 @@ strom_prps_item_free(strom_prps_item *pitem)
 
 
 
-/* alternative of the core nvme_alloc_iod */
-static struct nvme_iod *
-nvme_alloc_iod(size_t nbytes,
-			   mapped_gpu_memory *mgmem,
-			   struct nvme_dev *dev, gfp_t gfp)
-{
-	struct nvme_iod *iod;
-	unsigned int	nsegs;
-	unsigned int	nprps;
-	unsigned int	npages;
 
-	/*
-	 * Will slightly overestimate the number of pages needed.  This is OK
-	 * as it only leads to a small amount of wasted memory for the lifetime of
-	 * the I/O.
-	 */
-	nsegs = DIV_ROUND_UP(nbytes + mgmem->gpu_page_sz, mgmem->gpu_page_sz);
-	nprps = DIV_ROUND_UP(nbytes + dev->page_size, dev->page_size);
-	npages = DIV_ROUND_UP(8 * nprps, dev->page_size - 8);
-
-	iod = kmalloc(offsetof(struct nvme_iod, sg[nsegs]) +
-				  sizeof(__le64) * npages, gfp);
-	if (iod)
-	{
-		iod->private = 0;
-		iod->npages = -1;
-		iod->offset = offsetof(struct nvme_iod, sg[nsegs]);
-		iod->length = nbytes;
-		iod->nents = 0;
-		iod->first_dma = 0ULL;
-	}
-	sg_init_table(iod->sg, nsegs);
-
-	return iod;
-}
 
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
@@ -1392,13 +1371,12 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
-	struct nvme_iod	   *iod;
-	size_t				offset;
-	size_t				total_nbytes;
-	dma_addr_t			base_addr;
+	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
+	strom_prps_item	   *pitem;
+	ssize_t				total_nbytes;
+	dma_addr_t			curr_paddr;
 	int					length;
-	int					i, base;
-	int					retval;
+	int					i, retval;
 
 	/* sanity checks */
 	Assert(nvme_ns != NULL);
@@ -1411,46 +1389,27 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 											 mgmem->map_length))
 		return -ERANGE;
 
-	iod = nvme_alloc_iod(total_nbytes,
-						 mgmem,
-						 nvme_ns->dev,
-						 GFP_KERNEL);
-	if (!iod)
+	pitem = strom_prps_item_alloc(mgmem, nvme_dev);
+	if (!pitem)
 		return -ENOMEM;
 
-	base = (dtask->dest_offset >> mgmem->gpu_page_shift);
-	offset = (dtask->dest_offset & (mgmem->gpu_page_sz - 1));
-	prDebug("base=%d offset=%zu dest_offset=%zu total_nbytes=%zu",
-			base, offset, (size_t)dtask->dest_offset, total_nbytes);
-
-	for (i=0; i < page_table->entries; i++)
+	i =  (dtask->dest_offset >> mgmem->gpu_page_shift);
+	curr_paddr = (page_table->pages[i]->physical_address +
+				  (dtask->dest_offset & (mgmem->gpu_page_sz - 1)));
+	length = nvme_dev->page_size - (curr_paddr & (nvme_dev->page_size - 1));
+	for (i=0; total_nbytes > 0; i++)
 	{
-		if (!total_nbytes)
-			break;
-
-		base_addr = page_table->pages[base + i]->physical_address;
-		length = Min(total_nbytes, mgmem->gpu_page_sz - offset);
-		iod->sg[i].page_link = 0;
-		iod->sg[i].dma_address = base_addr + offset;
-		iod->sg[i].length = length;
-		iod->sg[i].dma_length = length;
-		iod->sg[i].offset = 0;
-
-		offset = 0;
+		pitem->prps_list[i] = curr_paddr;
+		curr_paddr += length;
 		total_nbytes -= length;
-	}
 
-	if (total_nbytes)
-	{
-		__nvme_free_iod(nvme_ns->dev, iod);
-		return -EINVAL;
+		length = Min(total_nbytes, nvme_dev->page_size);
 	}
-	sg_mark_end(&iod->sg[i]);
-	iod->nents = i;
+	pitem->nitems = i;
 
-	retval = nvme_submit_async_read_cmd(dtask, iod);
+	retval = nvme_submit_async_read_cmd(dtask, pitem);
 	if (retval)
-		__nvme_free_iod(nvme_ns->dev, iod);
+		strom_prps_item_free(pitem);
 
 	return retval;
 }
