@@ -25,6 +25,7 @@
 #include <linux/major.h>
 #include <linux/moduleparam.h>
 #include <linux/nvme.h>
+#include <linux/pci.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/version.h>
@@ -1197,6 +1198,143 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 }
 
 /*
+ * MEMO: nvme_setup_prps() in the vanilla kernel will lead scalability problem
+ * if large concurrent asynchronous DMA is issued. Core of the problem is
+ * dma_pool_alloc() to setup PRPs (Physical Region Page) list for NVMe's READ
+ * command. It tries to walk on a list of pre-allocated pages under spinlock.
+ * Concurrent workload easily grows length of the list up, then duration of
+ * the critical section makes longer.
+ * In case of NVMe-Strom, length of PRPs list is about (128KB / PAGE_SIZE
+ * + alpha for GPU page boundary) entries. So, we can pre-allocate fixed-
+ * length PRPs-list buffer, and we can look-up inactive buffer with one step.
+ */
+struct strom_prps_item
+{
+	struct list_head	chain;
+	struct nvme_dev	   *nvme_dev;
+	dma_addr_t			this_paddr;
+	/* below is fields for PRPs list */
+	dma_addr_t			first_dma;
+	unsigned int		nrooms;	/* size of prps_list[] array */
+	unsigned int		nitems;	/* usage count of prps_list[] array */
+	__le64				prps_list[0];
+};
+typedef struct strom_prps_item		strom_prps_item;
+#define STROM_PRPS_ITEMS_NSLOTS		32
+static spinlock_t		strom_prps_locks[STROM_PRPS_ITEMS_NSLOTS];
+static struct list_head	strom_prps_slots[STROM_PRPS_ITEMS_NSLOTS];
+
+static inline int
+strom_prps_item_hash(struct nvme_dev *nvme_dev)
+{
+	unsigned long	val = ((unsigned long)nvme_dev) >> 3;
+
+	return (((val      ) & 0xffff) |
+			((val >> 16) & 0xffff) |
+			((val >> 32) & 0xffff) |
+			((val >> 48) & 0xffff)) % STROM_PRPS_ITEMS_NSLOTS;
+}
+
+static void
+strom_prps_items_release(struct nvme_dev *nvme_dev)
+{
+	int		index, max;
+
+	if (nvme_dev)
+		index = max = strom_prps_item_hash(nvme_dev);
+	else
+	{
+		index = 0;
+		max = STROM_PRPS_ITEMS_NSLOTS - 1;
+	}
+
+	while (index <= max)
+	{
+		spinlock_t		   *lock = &strom_prps_locks[index];
+		struct list_head   *slot = &strom_prps_slots[index];
+		unsigned long		flags;
+		size_t				length;
+		strom_prps_item	   *pitem;
+
+		spin_lock_irqsave(lock, flags);
+		list_for_each_entry(pitem, slot, chain)
+		{
+			if (!nvme_dev || pitem->nvme_dev == nvme_dev)
+			{
+				length = offsetof(strom_prps_item,
+								  prps_list[pitem->nrooms]);
+				list_del(&pitem->chain);
+				dma_free_coherent(&nvme_dev->pci_dev->dev,
+								  length,
+								  pitem,
+								  pitem->this_paddr);
+			}
+		}
+		spin_unlock_irqrestore(lock, flags);
+	}
+}
+
+static strom_prps_item *
+strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
+{
+	int					index = strom_prps_item_hash(nvme_dev);
+	spinlock_t		   *lock = &strom_prps_locks[index];
+	struct list_head   *slot = &strom_prps_slots[index];
+	unsigned long		flags;
+	unsigned int		nrooms;
+	size_t				length;
+	dma_addr_t			this_paddr;
+	strom_prps_item	   *pitem;
+
+	spin_lock_irqsave(lock, flags);
+	list_for_each_entry(pitem, slot, chain)
+	{
+		if (pitem->nvme_dev == nvme_dev)
+		{
+			list_del(&pitem->chain);
+			memset(&pitem->chain, 0, sizeof(struct list_head));
+			spin_unlock_irqrestore(lock, flags);
+			return pitem;
+		}
+	}
+	spin_unlock_irqrestore(lock, flags);
+	/* no inactive buffer, allocate a new one */
+	nrooms = ((STROM_DMA_SSD2GPU_MAXLEN +
+			   nvme_dev->page_size - 1) / nvme_dev->page_size +
+			  (STROM_DMA_SSD2GPU_MAXLEN +
+			   mgmem->gpu_page_sz - 1) / mgmem->gpu_page_sz);
+	length = offsetof(strom_prps_item, prps_list[nrooms]);
+	pitem = dma_alloc_coherent(&nvme_dev->pci_dev->dev,
+							   length,
+							   &this_paddr,
+							   GFP_KERNEL);
+	if (!pitem)
+		return NULL;
+
+	pitem->nvme_dev = nvme_dev;
+	pitem->this_paddr = this_paddr;
+	pitem->first_dma = 0UL;
+	pitem->nrooms = nrooms;
+	pitem->nitems = 0;
+
+	return pitem;
+}
+
+static void
+strom_prps_item_free(strom_prps_item *pitem)
+{
+	int					index = strom_prps_item_hash(pitem->nvme_dev);
+	spinlock_t		   *lock = &strom_prps_locks[index];
+	struct list_head   *slot = &strom_prps_slots[index];
+	unsigned long		flags;
+
+	Assert(!pitem->chain.next && !pitem->chain.prev);
+	spin_lock_irqsave(lock, flags);
+	list_add(&pitem->chain, slot);
+	spin_unlock_irqrestore(lock, flags);
+}
+
+/*
  * DMA transaction for SSD->GPU asynchronous copy
  */
 #ifdef STROM_TARGET_KERNEL_RHEL7
@@ -1204,6 +1342,13 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
 #else
 #error "no platform specific NVMe-SSD routines"
 #endif
+
+
+
+
+
+
+
 
 /* alternative of the core nvme_alloc_iod */
 static struct nvme_iod *
@@ -1975,6 +2120,66 @@ static const struct file_operations nvme_strom_fops = {
 	.compat_ioctl	= strom_proc_ioctl,
 };
 
+/*
+ * Injection of PCI driver hook
+ */
+static void (*nvme_saved_on_pci_remove)(struct pci_dev *pdev) = NULL;
+
+static void
+nvme_strom_on_pci_remove(struct pci_dev *pdev)
+{
+	struct nvme_dev	   *nvme_dev = pci_get_drvdata(pdev);
+
+	/* cleanup resources relevant to nvme_dev */
+	strom_prps_items_release(nvme_dev);
+
+	if (nvme_saved_on_pci_remove)
+		nvme_saved_on_pci_remove(pdev);
+}
+
+static int
+nvme_strom_init_pci_hook(void)
+{
+	struct pci_driver  *nvme_driver;
+	struct device_driver *dev_driver;
+
+	dev_driver = driver_find("nvme", &pci_bus_type);
+	if (!dev_driver)
+	{
+		prError("PCI driver for NVMe SSD is not installed");
+		return -ENOENT;
+	}
+	if (dev_driver->owner != mod_nvme_submit_io_cmd)
+	{
+		prError("NVMe SSD driver has strange module ownership");
+		return -EINVAL;
+	}
+	/* inject nvme_strom_on_pci_remove as PCI remove hook */
+	nvme_driver = container_of(dev_driver, struct pci_driver, driver);
+	nvme_saved_on_pci_remove = nvme_driver->remove;
+	mb();
+	nvme_driver->remove = nvme_strom_on_pci_remove;
+
+	prNotice("PCI remove hook nvme_strom_on_pci_remove() injected");
+
+	return 0;
+}
+
+static void
+nvme_strom_exit_pci_hook(void)
+{
+	struct pci_driver  *nvme_driver;
+	struct device_driver *dev_driver;
+
+	dev_driver = driver_find("nvme", &pci_bus_type);
+	BUG_ON(!dev_driver || dev_driver->owner != mod_nvme_submit_io_cmd);
+	nvme_driver = container_of(dev_driver, struct pci_driver, driver);
+	BUG_ON(nvme_driver->remove == nvme_strom_on_pci_remove);
+	nvme_driver->remove = nvme_saved_on_pci_remove;
+	mb();
+}
+
+/* module init handler */
 int	__init nvme_strom_init(void)
 {
 	int			i, rc;
@@ -1995,29 +2200,48 @@ int	__init nvme_strom_init(void)
 		init_waitqueue_head(&strom_dma_task_waitq[i]);
 	}
 
+	/* init strom_prps_locks/slots */
+	for (i=0; i < STROM_PRPS_ITEMS_NSLOTS; i++)
+	{
+		spin_lock_init(&strom_prps_locks[i]);
+		INIT_LIST_HEAD(&strom_prps_slots[i]);
+	}
+
+	/* solve mandatory symbols */
+	rc = strom_init_extra_symbols();
+	if (rc)
+		goto error_1;
+	/* inject PCI remove hook */
+	rc = nvme_strom_init_pci_hook();
+	if (rc)
+		goto error_2;
 	/* make "/proc/nvme-strom" entry */
 	nvme_strom_proc = proc_create("nvme-strom",
 								  0444,
 								  NULL,
 								  &nvme_strom_fops);
 	if (!nvme_strom_proc)
-		return -ENOMEM;
-
-	/* solve mandatory symbols */
-	rc = strom_init_extra_symbols();
-	if (rc)
 	{
-		proc_remove(nvme_strom_proc);
-		return rc;
+		rc = -ENOMEM;
+		goto error_3;
 	}
 	prNotice("/proc/nvme-strom entry was registered");
 
 	return 0;
+
+error_3:
+	nvme_strom_exit_pci_hook();
+error_2:
+	strom_exit_extra_symbols();
+error_1:
+	return rc;
 }
 module_init(nvme_strom_init);
 
 void __exit nvme_strom_exit(void)
 {
+	strom_prps_items_release(NULL);
+	nvme_strom_exit_pci_hook();
 	strom_exit_extra_symbols();
 	proc_remove(nvme_strom_proc);
 	prNotice("/proc/nvme-strom entry was unregistered");
