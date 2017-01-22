@@ -167,7 +167,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	else if (npages < 2)
 		prp2 = pitem->prps_list[1];
 	else
-		prp2 = pitem->pitem_dma + offsetof(strom_prps_item, prps_list[0]);
+		prp2 = pitem->pitem_dma + offsetof(strom_prps_item, prps_list[1]);
 
 	/* private datum of async DMA call */
 	ssd2gpu_req = kzalloc(sizeof(strom_ssd2gpu_request), GFP_KERNEL);

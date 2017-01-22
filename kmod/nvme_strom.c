@@ -1264,27 +1264,31 @@ strom_prps_items_release(struct nvme_dev *nvme_dev)
 
 	while (index <= max)
 	{
-		spinlock_t		   *lock = &strom_prps_locks[index];
+//		spinlock_t		   *lock = &strom_prps_locks[index];
 		struct list_head   *slot = &strom_prps_slots[index];
-		unsigned long		flags;
+//		unsigned long		flags;
 		size_t				length;
 		strom_prps_item	   *pitem;
+		strom_prps_item	   *pnext;
 
-		spin_lock_irqsave(lock, flags);
-		list_for_each_entry(pitem, slot, chain)
+//		spin_lock_irqsave(lock, flags);
+		list_for_each_entry_safe(pitem, pnext, slot, chain)
 		{
 			if (!nvme_dev || pitem->nvme_dev == nvme_dev)
 			{
+				struct nvme_dev *this_dev = pitem->nvme_dev;
+
 				length = offsetof(strom_prps_item,
 								  prps_list[pitem->nrooms]);
 				list_del(&pitem->chain);
-				dma_free_coherent(&nvme_dev->pci_dev->dev,
+				dma_free_coherent(&this_dev->pci_dev->dev,
 								  length,
 								  pitem,
 								  pitem->pitem_dma);
 			}
 		}
-		spin_unlock_irqrestore(lock, flags);
+//		spin_unlock_irqrestore(lock, flags);
+		index++;
 	}
 }
 
@@ -1949,6 +1953,8 @@ ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
 	karg.values[0] = page_count;
 	karg.values[1] = small_count;
 
+
+
 	if (copy_to_user(uarg, &karg, sizeof(StromCmd__DebugCommand)))
 		retval = -EFAULT;
 out:
@@ -2171,9 +2177,9 @@ int	__init nvme_strom_init(void)
 	if (rc)
 		goto error_1;
 	/* inject PCI remove hook */
-	rc = nvme_strom_init_pci_hook();
-	if (rc)
-		goto error_2;
+//	rc = nvme_strom_init_pci_hook();
+//	if (rc)
+//		goto error_2;
 	/* make "/proc/nvme-strom" entry */
 	nvme_strom_proc = proc_create("nvme-strom",
 								  0444,
@@ -2189,8 +2195,8 @@ int	__init nvme_strom_init(void)
 	return 0;
 
 error_3:
-	nvme_strom_exit_pci_hook();
-error_2:
+//	nvme_strom_exit_pci_hook();
+//error_2:
 	strom_exit_extra_symbols();
 error_1:
 	return rc;
@@ -2200,7 +2206,7 @@ module_init(nvme_strom_init);
 void __exit nvme_strom_exit(void)
 {
 	strom_prps_items_release(NULL);
-	nvme_strom_exit_pci_hook();
+//	nvme_strom_exit_pci_hook();
 	strom_exit_extra_symbols();
 	proc_remove(nvme_strom_proc);
 	prNotice("/proc/nvme-strom entry was unregistered");

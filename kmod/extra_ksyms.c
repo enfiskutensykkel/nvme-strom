@@ -239,7 +239,7 @@ strom_put_all_extra_modules(void)
  * strom_cleanup_extra_symbols - release modules where the extra symbol
  * points to, and unregister the notifier.
  */
-static void __exit
+static void
 strom_exit_extra_symbols(void)
 {
 	unregister_module_notifier(&nvme_strom_nb);
