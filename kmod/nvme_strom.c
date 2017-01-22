@@ -1220,9 +1220,9 @@ strom_raid0_map_sector(struct r0conf *raid0_conf,
  * command. It tries to walk on a list of pre-allocated pages under spinlock.
  * Concurrent workload easily grows length of the list up, then duration of
  * the critical section makes longer.
- * In case of NVMe-Strom, length of PRPs list is about (128KB / PAGE_SIZE
- * + alpha for GPU page boundary) entries. So, we can pre-allocate fixed-
- * length PRPs-list buffer, and we can look-up inactive buffer with one step.
+ * In case of NVMe-Strom, length of PRPs list is about (128KB / PAGE_SIZE)
+ * entries. So, we can pre-allocate fixed-length PRPs-list buffer, and we can
+ * look-up inactive buffer with one step.
  */
 struct strom_prps_item
 {
@@ -1231,7 +1231,7 @@ struct strom_prps_item
 	unsigned int		cpu_id;	/* index to strom_prps_locks/slots */
 	unsigned int		nrooms;	/* size of prps_list[] array */
 	unsigned int		nitems;	/* usage count of prps_list[] array */
-	__le64				prps_list[0];
+	__le64				prps_list[STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1];
 };
 typedef struct strom_prps_item		strom_prps_item;
 #define STROM_PRPS_ITEMS_NSLOTS		32
@@ -1299,7 +1299,6 @@ strom_exit_prps_item_buffer(void)
 		spinlock_t		   *lock = &strom_prps_locks[index];
 		struct list_head   *slot = &strom_prps_slots[index];
 		unsigned long		flags;
-		size_t				length;
 		strom_prps_item	   *pitem;
 
 		spin_lock_irqsave(lock, flags);
@@ -1309,10 +1308,8 @@ strom_exit_prps_item_buffer(void)
 			list_del(&pitem->chain);
 			spin_unlock_irqrestore(lock, flags);
 
-			length = offsetof(strom_prps_item,
-							  prps_list[pitem->nrooms]);
 			dma_free_coherent(strom_prps_device,
-							  length,
+							  sizeof(strom_prps_item),
 							  pitem,
 							  pitem->pitem_dma);
 			spin_lock_irqsave(lock, flags);
@@ -1323,16 +1320,17 @@ strom_exit_prps_item_buffer(void)
 }
 
 static strom_prps_item *
-strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
+strom_prps_item_alloc(struct nvme_dev *nvme_dev)
 {
 	int					index = smp_processor_id() % STROM_PRPS_ITEMS_NSLOTS;
 	spinlock_t		   *lock = &strom_prps_locks[index];
 	struct list_head   *slot = &strom_prps_slots[index];
 	unsigned long		flags;
 	dma_addr_t			pitem_dma;
-	unsigned int		nrooms;
-	size_t				length;
 	strom_prps_item	   *pitem;
+
+	/* we assume min page size of NVMe-SSD is PAGE_SIZE */
+	WARN_ON(nvme_dev->page_size < PAGE_SIZE);
 
 	spin_lock_irqsave(lock, flags);
 	if (!list_empty(slot))
@@ -1346,11 +1344,8 @@ strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
 	/* create a new one if no active buffer now */
 	if (!pitem)
 	{
-		nrooms = ((STROM_DMA_SSD2GPU_MAXLEN + nvme_dev->page_size +
-				   nvme_dev->page_size - 1) / nvme_dev->page_size);
-		length = offsetof(strom_prps_item, prps_list[nrooms]);
 		pitem = dma_alloc_coherent(strom_prps_device,
-								   length,
+								   sizeof(strom_prps_item),
 								   &pitem_dma,
 								   GFP_KERNEL);
 		if (pitem)
@@ -1358,7 +1353,7 @@ strom_prps_item_alloc(mapped_gpu_memory *mgmem, struct nvme_dev *nvme_dev)
 			memset(&pitem->chain, 0, sizeof(struct list_head));
 			pitem->pitem_dma = pitem_dma;
 			pitem->cpu_id = smp_processor_id();
-			pitem->nrooms = nrooms;
+			pitem->nrooms = STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1;
 			pitem->nitems = 0;
 		}
 	}
@@ -1421,7 +1416,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 											 mgmem->map_length))
 		return -ERANGE;
 
-	pitem = strom_prps_item_alloc(mgmem, nvme_dev);
+	pitem = strom_prps_item_alloc(nvme_dev);
 	if (!pitem)
 		return -ENOMEM;
 
@@ -1431,6 +1426,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	length = nvme_dev->page_size - (curr_paddr & (nvme_dev->page_size - 1));
 	for (i=0; total_nbytes > 0; i++)
 	{
+		Assert(i < pitem->nrooms);
 		pitem->prps_list[i] = curr_paddr;
 		curr_paddr += length;
 		total_nbytes -= length;
