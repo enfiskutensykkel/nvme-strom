@@ -1339,23 +1339,21 @@ strom_prps_item_alloc(struct nvme_dev *nvme_dev)
 		list_del(&pitem->chain);
 		memset(&pitem->chain, 0, sizeof(struct list_head));
 		spin_unlock_irqrestore(lock, flags);
+		return pitem;
 	}
 	spin_unlock_irqrestore(lock, flags);
-	/* create a new one if no active buffer now */
-	if (!pitem)
+	/* no available prps_item, so create a new one */
+	pitem = dma_alloc_coherent(strom_prps_device,
+							   sizeof(strom_prps_item),
+							   &pitem_dma,
+							   GFP_KERNEL);
+	if (pitem)
 	{
-		pitem = dma_alloc_coherent(strom_prps_device,
-								   sizeof(strom_prps_item),
-								   &pitem_dma,
-								   GFP_KERNEL);
-		if (pitem)
-		{
-			memset(&pitem->chain, 0, sizeof(struct list_head));
-			pitem->pitem_dma = pitem_dma;
-			pitem->cpu_id = smp_processor_id();
-			pitem->nrooms = STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1;
-			pitem->nitems = 0;
-		}
+		memset(&pitem->chain, 0, sizeof(struct list_head));
+		pitem->pitem_dma = pitem_dma;
+		pitem->cpu_id = smp_processor_id();
+		pitem->nrooms = STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1;
+		pitem->nitems = 0;
 	}
 	return pitem;
 }
@@ -1426,6 +1424,8 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	length = nvme_dev->page_size - (curr_paddr & (nvme_dev->page_size - 1));
 	for (i=0; total_nbytes > 0; i++)
 	{
+		if (i == pitem->nrooms)
+			prNotice("pitem->nrooms=%u total_nbytes=%zu", pitem->nrooms, total_nbytes);
 		Assert(i < pitem->nrooms);
 		pitem->prps_list[i] = curr_paddr;
 		curr_paddr += length;

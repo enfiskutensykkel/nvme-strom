@@ -26,7 +26,7 @@ KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c		\
 		nvme_strom.rhel7.c md.rhel7.h raid0.rhel7.h
 
 obj-m := nvme_strom.o
-ccflags-y := -O0 -I. -I$(NVIDIA_SOURCE) 				\
+ccflags-y := -I. -I$(NVIDIA_SOURCE) 				\
 	-DNVME_STROM_VERSION='"$(NVME_STROM_VERSION)"'		\
 	-DNVME_STROM_BUILD_TIMESTAMP='"$(NVME_STROM_BUILD_TIMESTAMP)"'
 
