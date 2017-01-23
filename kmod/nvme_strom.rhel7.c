@@ -15,6 +15,7 @@ struct strom_ssd2gpu_request {
 	struct request	   *req;
 	strom_prps_item	   *pitem;
 	strom_dma_task	   *dtask;
+	uint64_t			tv1;	/* TSC value when DMA submit */
 };
 typedef struct strom_ssd2gpu_request	strom_ssd2gpu_request;
 
@@ -71,12 +72,21 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	strom_ssd2gpu_request *ssd2gpu_req = (strom_ssd2gpu_request *) ctx;
 	int		dma_status = le16_to_cpup(&cqe->status) >> 1;
 	u32		dma_result = le32_to_cpup(&cqe->result);
+	u64		tv1 = ssd2gpu_req->tv1;
+	u64		tv2 = rdtsc();
 
 	/*
 	 * FIXME: dma_status is one of NVME_SC_* (like NVME_SC_SUCCESS)
 	 * We have to translate it to host understandable error code
 	 */
 	prDebug("DMA Req Completed status=%d result=%u", dma_status, dma_result);
+
+	/* update statistics */
+	if (stat_info)
+	{
+		atomic64_inc(&stat_nr_ssd2gpu);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_ssd2gpu);
+	}
 
 	/* release resources and wake up waiter */
 	strom_prps_item_free(ssd2gpu_req->pitem);
@@ -187,6 +197,7 @@ nvme_submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	ssd2gpu_req->req = req;
 	ssd2gpu_req->pitem = pitem;
 	ssd2gpu_req->dtask = strom_get_dma_task(dtask);
+	ssd2gpu_req->tv1 = rdtsc();
 
 	/* setup READ command */
 	if (req->cmd_flags & REQ_FUA)

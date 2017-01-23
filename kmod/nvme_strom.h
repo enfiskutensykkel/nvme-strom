@@ -21,7 +21,7 @@ enum {
 	STROM_IOCTL__INFO_GPU_MEMORY			= _IO('S',0x84),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK	= _IO('S',0x90),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT		= _IO('S',0x91),
-	STROM_IOCTL__DEBUG_COMMAND				= _IO('S',0x99),
+	STROM_IOCTL__STAT_INFO					= _IO('S',0x99),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -99,12 +99,19 @@ typedef struct StromCmd__MemCpySsdToGpuWait
 	long			status;		/* out: status of the DMA task */
 } StromCmd__MemCpySsdToGpuWait;
 
-/* STROM_IOCTL__DEBUG */
-typedef struct StromCmd__DebugCommand
+/* STROM_IOCTL__STAT_INFO */
+typedef struct StromCmd__StatInfo
 {
-	unsigned long	handle;
-	int				file_desc;
-	unsigned long	values[8];
-} StromCmd__DebugCommand;
+	unsigned int	version;	/* = 1, always */
+	uint64_t		nr_ssd2gpu;
+	uint64_t		clk_ssd2gpu;
+	uint64_t		nr_setup_prps;
+	uint64_t		clk_setup_prps;
+	uint64_t		nr_submit_dma;
+	uint64_t		clk_submit_dma;
+	uint64_t		nr_wait_dtask;
+	uint64_t		clk_wait_dtask;
+	uint64_t		nr_wrong_wakeup;
+} StromCmd__StatInfo;
 
 #endif /* NVME_STROM_H */

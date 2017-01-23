@@ -58,6 +58,19 @@
 static int	verbose = 0;
 module_param(verbose, int, 0644);
 MODULE_PARM_DESC(verbose, "turn on/off debug message");
+/* run-time statistics */
+static int	stat_info = 1;
+module_param(stat_info, int, 0644);
+MODULE_PARM_DESC(stat_info, "turn on/off run-time statistics");
+static atomic64_t	stat_nr_ssd2gpu = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_ssd2gpu = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_setup_prps = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_setup_prps = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_submit_dma = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_submit_dma = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_wait_dtask = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_wait_dtask = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_wrong_wakeup = ATOMIC64_INIT(0);
 
 #define prDebug(fmt, ...)												\
 	do {																\
@@ -101,6 +114,23 @@ MODULE_PARM_DESC(verbose, "turn on/off debug message");
 
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
+
+/* RDTSC for STAT_INFO */
+static inline u64
+rdtsc(void)
+{
+#ifdef CONFIG_X86_64
+	if (stat_info)
+	{
+		unsigned int low, high;
+
+		asm volatile("rdtsc" : "=a" (low), "=d" (high));
+
+		return low | ((u64)high) << 32;
+	}
+#endif
+	return 0;
+}
 
 /*
  * ================================================================
@@ -1402,6 +1432,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	dma_addr_t			curr_paddr;
 	int					length;
 	int					i, retval;
+	u64					tv1, tv2;
 
 	/* sanity checks */
 	Assert(nvme_ns != NULL);
@@ -1414,6 +1445,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 											 mgmem->map_length))
 		return -ERANGE;
 
+	tv1 = rdtsc();
 	pitem = strom_prps_item_alloc(nvme_dev);
 	if (!pitem)
 		return -ENOMEM;
@@ -1434,11 +1466,23 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		length = Min(total_nbytes, nvme_dev->page_size);
 	}
 	pitem->nitems = i;
+	if (stat_info)
+	{
+		tv2 = rdtsc();
+		atomic64_inc(&stat_nr_setup_prps);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_setup_prps);
+	}
 
+	tv1 = rdtsc();
 	retval = nvme_submit_async_read_cmd(dtask, pitem);
 	if (retval)
 		strom_prps_item_free(pitem);
-
+	if (stat_info)
+	{
+		tv2 = rdtsc();
+		atomic64_inc(&stat_nr_submit_dma);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_submit_dma);
+	}
 	return retval;
 }
 
@@ -1456,9 +1500,12 @@ strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id,
 	unsigned long		flags = 0;
 	strom_dma_task	   *dtask;
 	struct list_head   *slot;
+	u64					tv1, tv2;
 	int					retval = 0;
-
+	bool				had_sleep = false;
 	DEFINE_WAIT(__wait);
+
+	tv1 = rdtsc();
 	for (;;)
 	{
 		bool	has_spinlock = false;
@@ -1515,10 +1562,18 @@ strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id,
 		/* wait for completion of DMA task */
 		prepare_to_wait(waitq, &__wait, task_state);
 		schedule();
+		if (stat_info && had_sleep)
+			atomic64_inc(&stat_nr_wrong_wakeup);
+		had_sleep = true;
 	}
 out:
 	finish_wait(waitq, &__wait);
-
+	tv2 = rdtsc();
+	if (stat_info && had_sleep)
+	{
+		atomic64_inc(&stat_nr_wait_dtask);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_wait_dtask);
+	}
 	return retval;
 }
 
@@ -1903,87 +1958,34 @@ out:
 }
 
 /*
- * STROM_IOCTL__DEBUG_COMMAND
+ * STROM_IOCTL__STAT_INFO
  */
-
-struct dma_pool {       /* the pool */
-    struct list_head page_list;
-    spinlock_t lock;
-    size_t size;
-    struct device *dev;
-    size_t allocation;
-    size_t boundary;
-    char name[32];
-    struct list_head pools;
-};
-
-struct dma_page {       /* cacheable header for 'allocation' bytes */
-    struct list_head page_list;
-    void *vaddr;
-    dma_addr_t dma;
-    unsigned int in_use;
-    unsigned int offset;
-};
-
 static int
-ioctl_debug_command(StromCmd__DebugCommand __user *uarg)
+ioctl_stat_info_command(StromCmd__StatInfo __user *uarg)
 {
-	StromCmd__DebugCommand	karg;
-	struct file			   *filp;
-	struct gendisk		   *bd_disk;
-	struct nvme_ns		   *nvme_ns;
-	struct nvme_dev		   *nvme_dev;
-	struct dma_pool		   *pool;
-	struct dma_page		   *page;
-	struct r0conf		   *raid0conf = NULL;
-	int						page_count = 0;
-	int						small_count = 0;
-	unsigned long			flags;
-	int						retval;
+	StromCmd__StatInfo	karg;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__DebugCommand)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__StatInfo)))
+		return -EFAULT;
+	if (karg.version != 1)
+		return -EINVAL;
+	if (!stat_info)
+		return -ENODATA;
+
+	karg.nr_ssd2gpu		= atomic64_read(&stat_nr_ssd2gpu);
+	karg.clk_ssd2gpu	= atomic64_read(&stat_clk_ssd2gpu);
+	karg.nr_setup_prps	= atomic64_read(&stat_nr_setup_prps);
+	karg.clk_setup_prps	= atomic64_read(&stat_clk_setup_prps);
+	karg.nr_submit_dma	= atomic64_read(&stat_nr_submit_dma);
+	karg.clk_submit_dma	= atomic64_read(&stat_clk_submit_dma);
+	karg.nr_wait_dtask	= atomic64_read(&stat_nr_wait_dtask);
+	karg.clk_wait_dtask	= atomic64_read(&stat_clk_wait_dtask);
+	karg.nr_wrong_wakeup = atomic64_read(&stat_nr_wrong_wakeup);
+
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__StatInfo)))
 		return -EFAULT;
 
-	filp = fget(karg.file_desc);
-	if (!filp)
-	{
-		prError("file descriptor %d of process %u is not available",
-				karg.file_desc, current->tgid);
-		return -EBADF;
-	}
-	retval = file_is_supported_nvme(filp, false, &raid0conf);
-	if (retval < 0 || raid0conf != NULL)
-	{
-		prError("file descriptor %d of process %u is not supported",
-				karg.file_desc, current->tgid);
-		goto out;
-	}
-	bd_disk = filp->f_inode->i_sb->s_bdev->bd_disk;
-	nvme_ns = (struct nvme_ns *) bd_disk->private_data;
-	nvme_dev = nvme_ns->dev;
-
-	pool = nvme_dev->prp_page_pool;
-	spin_lock_irqsave(&pool->lock, flags);
-	list_for_each_entry(page, &pool->page_list, page_list)
-		page_count++;
-	spin_unlock_irqrestore(&pool->lock, flags);
-
-	pool = nvme_dev->prp_small_pool;
-	spin_lock_irqsave(&pool->lock, flags);
-	list_for_each_entry(page, &pool->page_list, page_list)
-		small_count++;
-	spin_unlock_irqrestore(&pool->lock, flags);
-
-	karg.values[0] = page_count;
-	karg.values[1] = small_count;
-
-
-
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__DebugCommand)))
-		retval = -EFAULT;
-out:
-	fput(filp);
-	return retval;
+	return 0;
 }
 
 /* ================================================================
@@ -2088,8 +2090,8 @@ strom_proc_ioctl(struct file *ioctl_filp,
 											   ioctl_filp);
 			break;
 
-		case STROM_IOCTL__DEBUG_COMMAND:
-			retval = ioctl_debug_command((void __user *) arg);
+		case STROM_IOCTL__STAT_INFO:
+			retval = ioctl_stat_info_command((void __user *) arg);
 			break;
 
 		default:
