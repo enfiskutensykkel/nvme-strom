@@ -22,24 +22,32 @@
 #include <unistd.h>
 #include "nvme_strom.h"
 
-static double	clock_per_msec;
+static double	clock_per_usec;
 
 static void
 print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c)
 {
-	uint64_t	nr_ssd2gpu = c->nr_ssd2gpu - p->nr_ssd2gpu;
+  	uint64_t	nr_ssd2gpu = c->nr_ssd2gpu - p->nr_ssd2gpu;
 	uint64_t	clk_ssd2gpu = c->clk_ssd2gpu - p->clk_ssd2gpu;
+	uint64_t	nr_setup_prps = c->nr_setup_prps - p->nr_setup_prps;
+	uint64_t	clk_setup_prps = c->clk_setup_prps - p->clk_setup_prps;
+	uint64_t	nr_submit_dma = c->nr_submit_dma - p->nr_submit_dma;
+	uint64_t	clk_submit_dma = c->clk_submit_dma - p->clk_submit_dma;
 	uint64_t	nr_wait_dtask = c->nr_wait_dtask - p->nr_wait_dtask;
 	uint64_t	clk_wait_dtask = c->clk_wait_dtask - p->clk_wait_dtask;
 	uint64_t	nr_wrong_wakeup = c->nr_wrong_wakeup - p->nr_wrong_wakeup;
 
 	if (loop % 25 == 0)
-		printf("avg-dma   avg-wait   nr-wrong-wakeup\n");
-	printf("%.2fms\t%.2fms\t%ld\n",
+		printf("avg-dma  avg-prps  avg-submit  avg-wait  nr-wrong-wakeup\n");
+	printf("%.0fus\t%.0fus\t%.0fus\t%.0fus\t%ld\n",
 		   nr_ssd2gpu == 0 ? 0.0 :
-		   (double)(clk_ssd2gpu / nr_ssd2gpu) / clock_per_msec,
+		   (double)clk_ssd2gpu / ((double)nr_ssd2gpu * clock_per_usec),
+		   nr_setup_prps == 0 ? 0.0 :
+		   (double)clk_setup_prps / ((double)nr_setup_prps * clock_per_usec),
+		   nr_submit_dma == 0 ? 0.0 :
+		   (double)clk_submit_dma / ((double)nr_submit_dma * clock_per_usec),
 		   nr_wait_dtask == 0 ? 0.0 :
-		   (double)(clk_wait_dtask / nr_wait_dtask) / clock_per_msec,
+		   (double)clk_wait_dtask / ((double)nr_wait_dtask * clock_per_usec),
 		   nr_wrong_wakeup);
 }
 
@@ -97,7 +105,7 @@ main(int argc, char *argv[])
 			fprintf(stderr, "failed on sysconf(_SC_CLK_TCK): %m\n");
 			return 1;
 		}
-		clock_per_msec = (double)clock_per_sec / 1000.0;
+		clock_per_usec = (double)clock_per_sec / 1000000.0;
 
 		for (loop=-1; ; loop++)
 		{
