@@ -1972,6 +1972,7 @@ ioctl_stat_info_command(StromCmd__StatInfo __user *uarg)
 	if (!stat_info)
 		return -ENODATA;
 
+	karg.tsc			= rdtsc();
 	karg.nr_ssd2gpu		= atomic64_read(&stat_nr_ssd2gpu);
 	karg.clk_ssd2gpu	= atomic64_read(&stat_clk_ssd2gpu);
 	karg.nr_setup_prps	= atomic64_read(&stat_nr_setup_prps);

@@ -17,15 +17,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include "nvme_strom.h"
 
-static double	clock_per_usec;
+static void
+print_mean(uint64_t N, uint64_t clocks, double clock_per_sec)
+{
+	double		value;
+
+	if (N == 0)
+	{
+		printf("0.0s");
+		return;
+	}
+
+	value = (double)(clocks / N) / clock_per_sec;
+	if (value > 2.0)			/* 2.0s */
+		printf("%.2fs", value);
+	else if (value > 0.005)		/* 5ms */
+		printf("%.2fms", value / 1000.0);
+	else if (value > 0.000005)	/* 5us */
+		printf("%.2fus", value / 1000000.0);
+	else
+		printf("%.0fns", value / 1000000000.0);
+}
 
 static void
-print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c)
+print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
+		   struct timeval *tv1, struct timeval *tv2)
 {
   	uint64_t	nr_ssd2gpu = c->nr_ssd2gpu - p->nr_ssd2gpu;
 	uint64_t	clk_ssd2gpu = c->clk_ssd2gpu - p->clk_ssd2gpu;
@@ -36,19 +58,23 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c)
 	uint64_t	nr_wait_dtask = c->nr_wait_dtask - p->nr_wait_dtask;
 	uint64_t	clk_wait_dtask = c->clk_wait_dtask - p->clk_wait_dtask;
 	uint64_t	nr_wrong_wakeup = c->nr_wrong_wakeup - p->nr_wrong_wakeup;
+	double		interval;
+	double		clocks_per_sec;
+
+	interval = ((double)((tv2->tv_sec - tv1->tv_sec) * 1000000 +
+						 (tv2->tv_usec - tv1->tv_usec))) / 1000000.0;
+	clocks_per_sec = (double)(c->tsc - p->tsc) / interval;
 
 	if (loop % 25 == 0)
 		printf("avg-dma  avg-prps  avg-submit  avg-wait  nr-wrong-wakeup\n");
-	printf("%.0fus\t%.0fus\t%.0fus\t%.0fus\t%ld\n",
-		   nr_ssd2gpu == 0 ? 0.0 :
-		   (double)clk_ssd2gpu / ((double)nr_ssd2gpu * clock_per_usec),
-		   nr_setup_prps == 0 ? 0.0 :
-		   (double)clk_setup_prps / ((double)nr_setup_prps * clock_per_usec),
-		   nr_submit_dma == 0 ? 0.0 :
-		   (double)clk_submit_dma / ((double)nr_submit_dma * clock_per_usec),
-		   nr_wait_dtask == 0 ? 0.0 :
-		   (double)clk_wait_dtask / ((double)nr_wait_dtask * clock_per_usec),
-		   nr_wrong_wakeup);
+	print_mean(nr_ssd2gpu, clk_ssd2gpu, clocks_per_sec);
+	putchar('\t');
+	print_mean(nr_setup_prps, clk_setup_prps, clocks_per_sec);
+	putchar('\t');
+	print_mean(nr_submit_dma, clk_submit_dma, clocks_per_sec);
+	putchar('\t');
+	print_mean(nr_wait_dtask, clk_wait_dtask, clocks_per_sec);
+	printf("\t%ld\n", nr_wrong_wakeup);
 }
 
 static void
@@ -69,6 +95,7 @@ main(int argc, char *argv[])
 	int		c;
 	StromCmd__StatInfo	curr_stat;
 	StromCmd__StatInfo	prev_stat;
+	struct timeval		tv1, tv2;
 
 	while ((c = getopt(argc, argv, "h")) >= 0)
 	{
@@ -97,16 +124,6 @@ main(int argc, char *argv[])
 
 	if (interval > 0)
 	{
-		long	clock_per_sec;
-
-		clock_per_sec = sysconf(_SC_CLK_TCK);
-		if (clock_per_sec < 0)
-		{
-			fprintf(stderr, "failed on sysconf(_SC_CLK_TCK): %m\n");
-			return 1;
-		}
-		clock_per_usec = (double)clock_per_sec / 1000000.0;
-
 		for (loop=-1; ; loop++)
 		{
 			memset(&curr_stat, 0, sizeof(StromCmd__StatInfo));
@@ -117,10 +134,12 @@ main(int argc, char *argv[])
 						"failed on ioctl(STROM_IOCTL__STAT_INFO): %m\n");
 				return 1;
 			}
+			gettimeofday(&tv2, NULL);
 			if (loop >= 0)
-				print_stat(loop, &prev_stat, &curr_stat);
+				print_stat(loop, &prev_stat, &curr_stat, &tv1, &tv2);
 			sleep(interval);
 			memcpy(&prev_stat, &curr_stat, sizeof(StromCmd__StatInfo));
+			tv1 = tv2;
 		}
 	}
 	else

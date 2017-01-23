@@ -103,6 +103,7 @@ typedef struct StromCmd__MemCpySsdToGpuWait
 typedef struct StromCmd__StatInfo
 {
 	unsigned int	version;	/* = 1, always */
+	uint64_t		tsc;		/* tsc counter */
 	uint64_t		nr_ssd2gpu;
 	uint64_t		clk_ssd2gpu;
 	uint64_t		nr_setup_prps;
