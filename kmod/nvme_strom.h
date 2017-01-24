@@ -113,6 +113,8 @@ typedef struct StromCmd__StatInfo
 	uint64_t		nr_wait_dtask;
 	uint64_t		clk_wait_dtask;
 	uint64_t		nr_wrong_wakeup;
+	uint64_t		cur_dma_count;
+	uint64_t		max_dma_count;
 } StromCmd__StatInfo;
 
 #endif /* NVME_STROM_H */

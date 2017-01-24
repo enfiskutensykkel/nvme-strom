@@ -86,6 +86,7 @@ nvme_callback_async_read_cmd(struct nvme_queue *nvmeq, void *ctx,
 	{
 		atomic64_inc(&stat_nr_ssd2gpu);
 		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_ssd2gpu);
+		atomic64_dec(&stat_cur_dma_count);
 	}
 
 	/* release resources and wake up waiter */

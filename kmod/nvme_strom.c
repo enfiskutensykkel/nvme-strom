@@ -71,6 +71,8 @@ static atomic64_t	stat_clk_submit_dma = ATOMIC64_INIT(0);
 static atomic64_t	stat_nr_wait_dtask = ATOMIC64_INIT(0);
 static atomic64_t	stat_clk_wait_dtask = ATOMIC64_INIT(0);
 static atomic64_t	stat_nr_wrong_wakeup = ATOMIC64_INIT(0);
+static atomic64_t	stat_cur_dma_count = ATOMIC64_INIT(0);
+static atomic64_t	stat_max_dma_count = ATOMIC64_INIT(0);
 
 #define prDebug(fmt, ...)												\
 	do {																\
@@ -1150,12 +1152,6 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 
 /*
  * MD RAID-0 Support
- *
- *
- *
- *
- *
- *
  */
 static inline struct strip_zone *
 find_zone(struct r0conf *conf, sector_t *p_sector)
@@ -1411,15 +1407,6 @@ strom_prps_item_free(strom_prps_item *pitem)
 #error "no platform specific NVMe-SSD routines"
 #endif
 
-
-
-
-
-
-
-
-
-
 static int
 submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 {
@@ -1479,9 +1466,20 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		strom_prps_item_free(pitem);
 	if (stat_info)
 	{
+		long	oldval, curval, maxval;
+
 		tv2 = rdtsc();
 		atomic64_inc(&stat_nr_submit_dma);
 		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_submit_dma);
+
+		curval = atomic64_inc_return(&stat_cur_dma_count);
+		do
+		{
+			maxval = atomic64_read(&stat_max_dma_count);
+			if (curval <= maxval)
+				break;
+			oldval = atomic64_cmpxchg(&stat_max_dma_count, maxval, curval);
+		} while (oldval != maxval);
 	}
 	return retval;
 }
@@ -1982,6 +1980,8 @@ ioctl_stat_info_command(StromCmd__StatInfo __user *uarg)
 	karg.nr_wait_dtask	= atomic64_read(&stat_nr_wait_dtask);
 	karg.clk_wait_dtask	= atomic64_read(&stat_clk_wait_dtask);
 	karg.nr_wrong_wakeup = atomic64_read(&stat_nr_wrong_wakeup);
+	karg.cur_dma_count	= atomic64_read(&stat_cur_dma_count);
+	karg.max_dma_count	= atomic64_xchg(&stat_max_dma_count, 0UL);
 
 	if (copy_to_user(uarg, &karg, sizeof(StromCmd__StatInfo)))
 		return -EFAULT;

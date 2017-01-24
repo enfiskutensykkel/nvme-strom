@@ -30,7 +30,7 @@ print_mean(uint64_t N, uint64_t clocks, double clock_per_sec)
 
 	if (N == 0)
 	{
-		printf("0.0s");
+		printf("----");
 		return;
 	}
 
@@ -38,11 +38,11 @@ print_mean(uint64_t N, uint64_t clocks, double clock_per_sec)
 	if (value > 2.0)			/* 2.0s */
 		printf("%.2fs", value);
 	else if (value > 0.005)		/* 5ms */
-		printf("%.2fms", value / 1000.0);
+		printf("%.2fms", value * 1000.0);
 	else if (value > 0.000005)	/* 5us */
-		printf("%.2fus", value / 1000000.0);
+		printf("%.2fus", value * 1000000.0);
 	else
-		printf("%.0fns", value / 1000000000.0);
+		printf("%.0fns", value * 1000000000.0);
 }
 
 static void
@@ -66,7 +66,7 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 	clocks_per_sec = (double)(c->tsc - p->tsc) / interval;
 
 	if (loop % 25 == 0)
-		printf("avg-dma  avg-prps  avg-submit  avg-wait  nr-wrong-wakeup\n");
+		printf("avg-dma  avg-prps  avg-submit  avg-wait  bad-wakeup  DMA(cur)  DMA(max)\n");
 	print_mean(nr_ssd2gpu, clk_ssd2gpu, clocks_per_sec);
 	putchar('\t');
 	print_mean(nr_setup_prps, clk_setup_prps, clocks_per_sec);
@@ -74,7 +74,10 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 	print_mean(nr_submit_dma, clk_submit_dma, clocks_per_sec);
 	putchar('\t');
 	print_mean(nr_wait_dtask, clk_wait_dtask, clocks_per_sec);
-	printf("\t%ld\n", nr_wrong_wakeup);
+	printf("\t%lu\t%lu\t%lu\n",
+		   nr_wrong_wakeup,
+		   c->cur_dma_count,
+		   c->max_dma_count);
 }
 
 static void
@@ -151,16 +154,30 @@ main(int argc, char *argv[])
 			fprintf(stderr, "failed on ioctl(STROM_IOCTL__STAT_INFO): %m\n");
 			return 1;
 		}
-		printf("nr_ssd2gpu:      %lu\n"
+		printf("tsc:             %lu\n"
+			   "nr_ssd2gpu:      %lu\n"
 			   "clk_ssd2gpu:     %lu\n"
+			   "nr_setup_prps:   %lu\n"
+			   "clk_setup_prps:  %lu\n"
+			   "nr_submit_dma:   %lu\n"
+			   "clk_submit_dma:  %lu\n"
 			   "nr_wait_dtask:   %lu\n"
 			   "clk_wait_dtask:  %lu\n"
-			   "nr_wrong_wakeup: %lu\n",
+			   "nr_wrong_wakeup: %lu\n"
+			   "cur_dma_count:   %lu\n"
+			   "max_dma_count:   %lu\n",
+			   (unsigned long)curr_stat.tsc,
 			   (unsigned long)curr_stat.nr_ssd2gpu,
 			   (unsigned long)curr_stat.clk_ssd2gpu,
+			   (unsigned long)curr_stat.nr_setup_prps,
+			   (unsigned long)curr_stat.clk_setup_prps,
+			   (unsigned long)curr_stat.nr_submit_dma,
+			   (unsigned long)curr_stat.clk_submit_dma,
 			   (unsigned long)curr_stat.nr_wait_dtask,
 			   (unsigned long)curr_stat.clk_wait_dtask,
-			   (unsigned long)curr_stat.nr_wrong_wakeup);
+			   (unsigned long)curr_stat.nr_wrong_wakeup,
+			   (unsigned long)curr_stat.cur_dma_count,
+			   (unsigned long)curr_stat.max_dma_count);
 	}
 	close(fdesc);
 	return 0;
