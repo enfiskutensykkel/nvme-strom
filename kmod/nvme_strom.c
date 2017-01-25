@@ -74,6 +74,20 @@ static atomic64_t	stat_nr_wrong_wakeup = ATOMIC64_INIT(0);
 static atomic64_t	stat_cur_dma_count = ATOMIC64_INIT(0);
 static atomic64_t	stat_max_dma_count = ATOMIC64_INIT(0);
 
+static inline long
+atomic64_max_return(long newval, atomic64_t *atomic_ptr)
+{
+	long	oldval, maxval;
+	do {
+		maxval = atomic64_read(atomic_ptr);
+		if (newval <= maxval)
+			break;
+		oldval = atomic64_cmpxchg(atomic_ptr, maxval, newval);
+	} while (oldval != maxval);
+	return maxval;
+}
+
+
 #define prDebug(fmt, ...)												\
 	do {																\
 		if (verbose > 1)												\
@@ -1466,20 +1480,14 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		strom_prps_item_free(pitem);
 	if (stat_info)
 	{
-		long	oldval, curval, maxval;
+		long	curval;
 
 		tv2 = rdtsc();
 		atomic64_inc(&stat_nr_submit_dma);
 		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_submit_dma);
 
 		curval = atomic64_inc_return(&stat_cur_dma_count);
-		do
-		{
-			maxval = atomic64_read(&stat_max_dma_count);
-			if (curval <= maxval)
-				break;
-			oldval = atomic64_cmpxchg(&stat_max_dma_count, maxval, curval);
-		} while (oldval != maxval);
+		atomic64_max_return(curval, &stat_max_dma_count);
 	}
 	return retval;
 }
