@@ -46,6 +46,7 @@ install-dkms:
 	mkdir -p $(DKMS_DEST)
 	install -m 0644 dkms.conf Makefile $(KMOD_SOURCE) $(DKMS_DEST)
 	install -m 0644 nvme_strom.modprobe.conf /etc/modprobe.d
+	install -m 0644 nvme_strom.modload.conf  /etc/modules-load.d
 
 clean:
 	rm -f $(EXTRA_CLEAN)

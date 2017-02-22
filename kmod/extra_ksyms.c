@@ -10,6 +10,9 @@
 #error Linux kernel must be built with CONFIG_KALLSYMS
 #endif
 
+/* handler of nvme.ko module */
+static struct module *mod_nvme = NULL;
+
 #ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 /* nvidia_p2p_get_pages */
 static struct module *mod_nvidia_p2p_get_pages = NULL;
@@ -103,49 +106,6 @@ __xfs_get_blocks(struct inode *inode, sector_t offset,
 	return p_xfs_get_blocks(inode, offset, bh, create);
 }
 
-/* nvme_submit_io_cmd */
-#if 1
-static struct module *mod_nvme_submit_io_cmd = NULL;
-static int (* p_nvme_submit_io_cmd)(struct nvme_dev *dev,
-									struct nvme_ns *ns,
-									struct nvme_command *cmd,
-									u32 *result) = NULL;
-static inline int
-__nvme_submit_io_cmd(struct nvme_dev *dev, struct nvme_ns *ns,
-					 struct nvme_command *cmd, u32 *result)
-{
-	BUG_ON(!p_nvme_submit_io_cmd);
-	return p_nvme_submit_io_cmd(dev, ns, cmd, result);
-}
-#endif
-
-/* nvme_setup_prps */
-static struct module *mod_nvme_setup_prps = NULL;
-static int (* p_nvme_setup_prps)(struct nvme_dev *dev,
-								 struct nvme_iod *iod,
-								 int total_len, gfp_t gfp) ;
-static inline int
-__nvme_setup_prps(struct nvme_dev *dev,
-				  struct nvme_iod *iod,
-				  int total_len, gfp_t gfp)
-{
-	BUG_ON(!p_nvme_setup_prps);
-	return p_nvme_setup_prps(dev, iod, total_len, gfp);
-}
-
-/* nvme_free_iod */
-#if 1
-static struct module *mod_nvme_free_iod = NULL;
-static void (* p_nvme_free_iod)(struct nvme_dev *dev,
-								struct nvme_iod *iod) = NULL;
-static inline void
-__nvme_free_iod(struct nvme_dev *dev, struct nvme_iod *iod)
-{
-	BUG_ON(!p_nvme_free_iod);
-	p_nvme_free_iod(dev, iod);
-}
-#endif
-
 /*
  * __strom_lookup_extra_symbol - lookup extra symbol and grab module if any
  */
@@ -221,18 +181,17 @@ static struct notifier_block nvme_strom_nb = {
 static inline void
 strom_put_all_extra_modules(void)
 {
+	/* nvme.ko */
+	module_put(mod_nvme);
 #ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 	/* nvidia */
 	module_put(mod_nvidia_p2p_get_pages);
 	module_put(mod_nvidia_p2p_put_pages);
 	module_put(mod_nvidia_p2p_free_page_table);
+#endif
+	/* file systems */
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
-#endif
-	/* nvme */
-	module_put(mod_nvme_submit_io_cmd);
-	module_put(mod_nvme_setup_prps);
-	module_put(mod_nvme_free_iod);
 }
 
 /*
@@ -270,11 +229,14 @@ strom_init_extra_symbols(void)
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
 #endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
-	/* nvme.ko */
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_free_iod);
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_submit_io_cmd);
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_setup_prps);
 
+	/* Grab nvme.ko module; we are under the module_mutex. */
+	mod_nvme = find_module("nvme");
+	if (!mod_nvme)
+	{
+		rc = -ENOENT;
+		goto cleanup;
+	}
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
 	if (rc)

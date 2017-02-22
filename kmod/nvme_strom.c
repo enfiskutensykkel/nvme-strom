@@ -1304,8 +1304,7 @@ strom_init_prps_item_buffer(void)
 	 * Try to acquire a PCI device which is likely NVMe-SSD.
 	 */
 	dev_driver = driver_find("nvme", &pci_bus_type);
-	if (dev_driver &&
-		dev_driver->owner == mod_nvme_submit_io_cmd)
+	if (dev_driver && dev_driver->owner == mod_nvme)
 	{
 		strom_prps_device = bus_find_device(&pci_bus_type, NULL,
 											to_pci_driver(dev_driver),
