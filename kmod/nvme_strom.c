@@ -1359,7 +1359,7 @@ strom_exit_prps_item_buffer(void)
 }
 
 static strom_prps_item *
-strom_prps_item_alloc(struct nvme_dev *nvme_dev)
+strom_prps_item_alloc(void)
 {
 	int					index = smp_processor_id() % STROM_PRPS_ITEMS_NSLOTS;
 	spinlock_t		   *lock = &strom_prps_locks[index];
@@ -1367,9 +1367,6 @@ strom_prps_item_alloc(struct nvme_dev *nvme_dev)
 	unsigned long		flags;
 	dma_addr_t			pitem_dma;
 	strom_prps_item	   *pitem;
-
-	/* we assume min page size of NVMe-SSD is PAGE_SIZE */
-	WARN_ON(nvme_dev->page_size < PAGE_SIZE);
 
 	spin_lock_irqsave(lock, flags);
 	if (!list_empty(slot))
@@ -1436,6 +1433,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 
 	/* sanity checks */
 	Assert(nvme_ns != NULL);
+	WARN_ON(nvme_dev->page_size < PAGE_SIZE);
 
 	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
 	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
@@ -1446,7 +1444,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		return -ERANGE;
 
 	tv1 = rdtsc();
-	pitem = strom_prps_item_alloc(nvme_dev);
+	pitem = strom_prps_item_alloc();
 	if (!pitem)
 		return -ENOMEM;
 
