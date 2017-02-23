@@ -10,9 +10,6 @@
 #error Linux kernel must be built with CONFIG_KALLSYMS
 #endif
 
-/* handler of nvme.ko module */
-static struct module *mod_nvme = NULL;
-
 #ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 /* nvidia_p2p_get_pages */
 static struct module *mod_nvidia_p2p_get_pages = NULL;
@@ -77,6 +74,21 @@ __nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table)
 	return p_nvidia_p2p_free_page_table(page_table);
 }
 #endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
+
+/* nvme_alloc_request */
+static struct module *mod_nvme_alloc_request = NULL;
+static struct request *(*p_nvme_alloc_request)(
+	struct request_queue *q,
+	struct nvme_command *cmd,
+	unsigned int flags) = NULL;
+
+static inline struct request *
+__nvme_alloc_request(struct request_queue *q,
+					 struct nvme_command *cmd, unsigned int flags)
+{
+	BUG_ON(!p_nvme_alloc_request);
+	return p_nvme_alloc_request(q, cmd, flags);
+}
 
 /* ext4_get_block */
 static struct module *mod_ext4_get_block = NULL;
@@ -181,14 +193,14 @@ static struct notifier_block nvme_strom_nb = {
 static inline void
 strom_put_all_extra_modules(void)
 {
-	/* nvme.ko */
-	module_put(mod_nvme);
 #ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 	/* nvidia */
 	module_put(mod_nvidia_p2p_get_pages);
 	module_put(mod_nvidia_p2p_put_pages);
 	module_put(mod_nvidia_p2p_free_page_table);
 #endif
+	/* nvme */
+	module_put(mod_nvme_alloc_request);
 	/* file systems */
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
@@ -229,14 +241,8 @@ strom_init_extra_symbols(void)
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
 #endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
-
-	/* Grab nvme.ko module; we are under the module_mutex. */
-	mod_nvme = find_module("nvme");
-	if (!mod_nvme)
-	{
-		rc = -ENOENT;
-		goto cleanup;
-	}
+	/* nvme.ko */
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_alloc_request);
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
 	if (rc)

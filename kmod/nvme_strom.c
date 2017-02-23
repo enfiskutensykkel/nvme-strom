@@ -16,9 +16,11 @@
  * GNU General Public License for more details.
  */
 #include <asm/uaccess.h>
+#include <linux/blk-mq.h>
 #include <linux/buffer_head.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/idr.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/magic.h>
@@ -29,6 +31,7 @@
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/version.h>
+#include <uapi/linux/nvme_ioctl.h>
 #include <generated/utsrelease.h>
 #include "nv-p2p.h"
 #include "nvme_strom.h"
@@ -36,8 +39,9 @@
 /* determine the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
 #define STROM_TARGET_KERNEL_RHEL7		1
-#include "md.rhel7.h"
-#include "raid0.rhel7.h"
+#include "md.rhel7.h"		/* drivers/md/md.h */
+#include "raid0.rhel7.h"	/* drivers/md/raid0.h */
+#include "nvme.rhel7.h"		/* drivers/nvme/host/nvme.h */
 #else
 #error Not a supported Linux kernel
 #endif
@@ -131,22 +135,10 @@ atomic64_max_return(long newval, atomic64_t *atomic_ptr)
 /* procfs entry of "/proc/nvme-strom" */
 static struct proc_dir_entry  *nvme_strom_proc = NULL;
 
-/* RDTSC for STAT_INFO */
-static inline u64
-rdtsc(void)
-{
-#ifdef CONFIG_X86_64
-	if (stat_info)
-	{
-		unsigned int low, high;
-
-		asm volatile("rdtsc" : "=a" (low), "=d" (high));
-
-		return low | ((u64)high) << 32;
-	}
+/* rdtsc() is defined at msr.h if x86_64 */
+#ifndef CONFIG_X86_64
+#define rdtsc()				(0UL)
 #endif
-	return 0;
-}
 
 /*
  * ================================================================
@@ -197,7 +189,8 @@ struct mapped_gpu_memory
 };
 typedef struct mapped_gpu_memory	mapped_gpu_memory;
 
-#define MAPPED_GPU_MEMORY_NSLOTS	48
+#define MAPPED_GPU_MEMORY_NSLOTS_BITS	6
+#define MAPPED_GPU_MEMORY_NSLOTS		(1UL << MAPPED_GPU_MEMORY_NSLOTS_BITS)
 static spinlock_t		strom_mgmem_locks[MAPPED_GPU_MEMORY_NSLOTS];
 static struct list_head	strom_mgmem_slots[MAPPED_GPU_MEMORY_NSLOTS];
 
@@ -207,9 +200,7 @@ static struct list_head	strom_mgmem_slots[MAPPED_GPU_MEMORY_NSLOTS];
 static inline int
 strom_mapped_gpu_memory_index(unsigned long handle)
 {
-	u32		hash = arch_fast_hash(&handle, sizeof(unsigned long),
-								  0x20140702);
-	return hash % MAPPED_GPU_MEMORY_NSLOTS;
+	return hash_long(handle, MAPPED_GPU_MEMORY_NSLOTS_BITS);
 }
 
 /*
@@ -761,7 +752,7 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	 */
 	mddev = bd_disk->private_data;
 
-	if (!mddev || !mddev->pers || !mddev->ready)
+	if (!mddev || !mddev->pers)
 	{
 		prError("md-device '%s' is not ready to handle i/o",
 				bd_disk->disk_name);
@@ -944,6 +935,8 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
  */
 #define STROM_DMA_SSD2GPU_MAXLEN		(128 * 1024)
 
+struct nvme_ns;
+
 struct strom_dma_task
 {
 	struct list_head	chain;
@@ -986,7 +979,8 @@ struct strom_dma_task
 };
 typedef struct strom_dma_task	strom_dma_task;
 
-#define STROM_DMA_TASK_NSLOTS		240
+#define STROM_DMA_TASK_NSLOTS_BITS	9
+#define STROM_DMA_TASK_NSLOTS		(1UL << STROM_DMA_TASK_NSLOTS_BITS)
 static spinlock_t		strom_dma_task_locks[STROM_DMA_TASK_NSLOTS];
 static struct list_head	strom_dma_task_slots[STROM_DMA_TASK_NSLOTS];
 static struct list_head	failed_dma_task_slots[STROM_DMA_TASK_NSLOTS];
@@ -998,9 +992,7 @@ static wait_queue_head_t strom_dma_task_waitq[STROM_DMA_TASK_NSLOTS];
 static inline int
 strom_dma_task_index(unsigned long dma_task_id)
 {
-	u32		hash = arch_fast_hash(&dma_task_id, sizeof(unsigned long),
-								  0x20120106);
-	return hash % STROM_DMA_TASK_NSLOTS;
+	return hash_64(dma_task_id, STROM_DMA_TASK_NSLOTS_BITS);
 }
 
 /*
@@ -1304,7 +1296,7 @@ strom_init_prps_item_buffer(void)
 	 * Try to acquire a PCI device which is likely NVMe-SSD.
 	 */
 	dev_driver = driver_find("nvme", &pci_bus_type);
-	if (dev_driver && dev_driver->owner == mod_nvme)
+	if (dev_driver && dev_driver->owner == mod_nvme_alloc_request)
 	{
 		strom_prps_device = bus_find_device(&pci_bus_type, NULL,
 											to_pci_driver(dev_driver),
@@ -1423,17 +1415,17 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
 	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
-	struct nvme_dev	   *nvme_dev = nvme_ns->dev;
 	strom_prps_item	   *pitem;
 	ssize_t				total_nbytes;
 	dma_addr_t			curr_paddr;
 	int					length;
 	int					i, retval;
+	u32					nvme_page_size = nvme_ns->ctrl->page_size;
 	u64					tv1, tv2;
 
 	/* sanity checks */
 	Assert(nvme_ns != NULL);
-	WARN_ON(nvme_dev->page_size < PAGE_SIZE);
+	WARN_ON(nvme_page_size < PAGE_SIZE);
 
 	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
 	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
@@ -1451,7 +1443,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	i =  (dtask->dest_offset >> mgmem->gpu_page_shift);
 	curr_paddr = (page_table->pages[i]->physical_address +
 				  (dtask->dest_offset & (mgmem->gpu_page_sz - 1)));
-	length = nvme_dev->page_size - (curr_paddr & (nvme_dev->page_size - 1));
+	length = nvme_page_size - (curr_paddr & (nvme_page_size - 1));
 	for (i=0; total_nbytes > 0; i++)
 	{
 		if (i == pitem->nrooms)
@@ -1461,7 +1453,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 		curr_paddr += length;
 		total_nbytes -= length;
 
-		length = Min(total_nbytes, nvme_dev->page_size);
+		length = Min(total_nbytes, nvme_page_size);
 	}
 	pitem->nitems = i;
 	if (stat_info)
