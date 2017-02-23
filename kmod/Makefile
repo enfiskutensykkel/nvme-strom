@@ -9,6 +9,15 @@ DKMS_DEST=/usr/src/$(NVME_STROM_PKGNAME)-$(NVME_STROM_VERSION)
 KERNEL_VER := $(shell uname -r)
 KERNEL_DIR := /lib/modules/$(KERNEL_VER)
 KERNEL_SOURCE := $(KERNEL_DIR)/build
+KERNEL_VERSION_NUM := $(shell echo $(KERNEL_VER)	\
+	| sed -s 's/-/ /g' | awk '{print $$1}'		\
+	| sed -e 's/\./ /g' -e 's/[A-Za-z].*$$//g'	\
+	| awk '{printf "%d%02d%02d", $$1, $$2, (NF >=3) ? $$3 : 0}')
+KERNEL_RELEASE_NUM := $(shell echo $(KERNEL_VER)	\
+	| sed -s 's/-/ /g' | awk '{print $$2}'		\
+	| sed -e 's/\./ /g' -e 's/[A-Za-z].*$$//g'	\
+	| awk '{printf "%d", $$1}')
+
 # MEMO: Older version of CUDA driver provided the kernel header files
 # at '/usr/src/nvidia-*/nv-p2p.h'.
 NVIDIA_SOURCE := $(shell ls -St /usr/src/nvidia-*/nv-p2p.h \
@@ -28,7 +37,9 @@ KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c		\
 obj-m := nvme_strom.o
 ccflags-y := -I. -I$(NVIDIA_SOURCE) 				\
 	-DNVME_STROM_VERSION='"$(NVME_STROM_VERSION)"'		\
-	-DNVME_STROM_BUILD_TIMESTAMP='"$(NVME_STROM_BUILD_TIMESTAMP)"'
+	-DNVME_STROM_BUILD_TIMESTAMP='"$(NVME_STROM_BUILD_TIMESTAMP)"' \
+	-DKERNEL_VERSION_NUM=$(KERNEL_VERSION_NUM)		\
+	-DKERNEL_RELEASE_NUM=$(KERNEL_RELEASE_NUM)
 
 default: modules nvme_test nvme_stat
 
