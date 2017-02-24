@@ -38,18 +38,7 @@
 
 /* determine the target kernel to build */
 #if defined(RHEL_MAJOR) && (RHEL_MAJOR == 7)
-#if KERNEL_VERSION_NUM == 31000
-#if KERNEL_RELEASE_NUM >= 514
-#define STROM_TARGET_KERNEL_RHEL7		1
-#include "md.rhel7.h"		/* drivers/md/md.h */
-#include "raid0.rhel7.h"	/* drivers/md/raid0.h */
-#include "nvme.rhel7.h"		/* drivers/nvme/host/nvme.h */
-#else
-#error Not a supported kernel release - update the kernel package
-#endif
-#else
-#error Unexpected kernel version for RHEL7/CentOS7
-#endif
+#include "rhel7_local.h"	/* local headers in RHEL7/CentOS7 kernel */
 #else
 #error Not a supported Linux Distribution
 #endif
