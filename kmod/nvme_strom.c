@@ -2069,7 +2069,8 @@ out:
  * ================================================================ */
 struct strom_dma_buffer
 {
-	size_t			length;		/* Size required on allocation */
+	size_t			length;		/* size required on allocation */
+	atomic_t		refcnt;		/* reference count */
 	int				node_id;	/* NUMA node id */
 	unsigned int	chunk_sz;	/* # of pages per chunk; (1UL<<(MAX_ORDER-1))*/
 	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
@@ -2077,6 +2078,65 @@ struct strom_dma_buffer
 };
 typedef struct strom_dma_buffer		strom_dma_buffer;
 
+/*
+ * get_strom_dma_buffer
+ */
+static strom_dma_buffer *
+get_strom_dma_buffer(strom_dma_buffer *sd_buf)
+{
+	int		refcnt		__attribute__((unused));
+
+	refcnt = atomic_inc_return(&sd_buf->refcnt);
+	Assert(refcnt > 1);
+	return sd_buf;
+}
+
+/*
+ * put_strom_dma_buffer
+ */
+static void
+put_strom_dma_buffer(strom_dma_buffer *sd_buf)
+{
+	if (atomic_dec_and_test(&sd_buf->refcnt))
+	{
+		int		i, j;
+
+		for (i=0; i < sd_buf->nr_chunks; i++)
+		{
+			for (j=0; j < sd_buf->chunk_sz; j++)
+				__free_page(sd_buf->dma_chunks[i] + j);
+		}
+		kfree(sd_buf);
+	}
+}
+
+/*
+ * ioctl_memcpy_ssd2ram_async - handler for STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC
+ */
+static int
+ioctl_memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync __user *uarg,
+						   struct file *ioctl_filp)
+{
+
+	// pick up sd_buf from vma
+	// enqueue dma request
+
+	return -EINVAL;
+}
+
+/*
+ * ioctl_memcpy_ssd2ram_wait - handler for STROM_IOCTL__MEMCPY_SSD2RAM_WAIT
+ */
+static int
+ioctl_memcpy_ssd2ram_wait(StromCmd__MemCpySsdToRamWait __user *uarg,
+						  struct file *ioctl_filp)
+{
+	return -EINVAL;
+}
+
+/*
+ * strom_dma_buffer_fault - fault handler of DMA buffer
+ */
 static int
 strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
@@ -2137,15 +2197,7 @@ strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
 static int
 strom_dma_buffer_release(struct inode *inode, struct file *filp)
 {
-	strom_dma_buffer *sd_buf = filp->private_data;
-	int		i, j;
-
-	for (i=0; i < sd_buf->nr_chunks; i++)
-	{
-		for (j=0; j < sd_buf->chunk_sz; j++)
-			__free_page(sd_buf->dma_chunks[i] + j);
-	}
-	kfree(sd_buf);
+	put_strom_dma_buffer((strom_dma_buffer *) filp->private_data);
 
 	return 0;
 }
@@ -2194,6 +2246,7 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 		return -ENOMEM;
 
 	sd_buf->length  = karg.length;
+	atomic_set(&sd_buf->refcnt, 1);
 	sd_buf->node_id = karg.node_id;
 	sd_buf->chunk_sz = chunk_sz;
 	sd_buf->nr_chunks = nr_chunks;
@@ -2381,6 +2434,16 @@ strom_proc_ioctl(struct file *ioctl_filp,
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
+											   ioctl_filp);
+			break;
+
+		case STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC:
+			retval = ioctl_memcpy_ssd2ram_async((void __user *) arg,
+												ioctl_filp);
+			break;
+
+		case STROM_IOCTL__MEMCPY_SSD2RAM_WAIT:
+			retval = ioctl_memcpy_ssd2ram_wait((void __user *) arg,
 											   ioctl_filp);
 			break;
 

@@ -111,7 +111,7 @@ typedef struct StromCmd__MemCpySsdToRamAsync
 	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
 	unsigned int	nr_ssd2ram; /* out: # of SSD2RAM chunks */
 
-	void __user	   *dest_addr;  /* in: virtual address of the destinatio
+	void __user	   *dest_addr;  /* in: virtual address of the destination
 								 *     buffer; which must be mapped using
 								 *     mmap(2) on /proc/nvme-strom */
 	int				file_desc;	/* in: file descriptor of the source file */
