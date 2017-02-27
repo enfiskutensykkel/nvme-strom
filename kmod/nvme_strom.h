@@ -9,6 +9,7 @@
 #ifndef NVME_STROM_H
 #define NVME_STROM_H
 #ifndef __KERNEL__
+#include <stdint.h>
 #define __user
 #endif
 #include <asm/ioctl.h>

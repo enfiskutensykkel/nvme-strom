@@ -2069,8 +2069,9 @@ out:
  * ================================================================ */
 struct strom_dma_buffer
 {
+	size_t			length;		/* Size required on allocation */
 	int				node_id;	/* NUMA node id */
-	unsigned int	order;		/* usually, MAX_ORDER */
+	unsigned int	chunk_sz;	/* # of pages per chunk; (1UL<<(MAX_ORDER-1))*/
 	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
 	struct page	   *dma_chunks[1];
 };
@@ -2080,19 +2081,20 @@ static int
 strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	strom_dma_buffer *sd_buf = vma->vm_private_data;
-	unsigned int	unitsz;
+	struct page	   *dma_page;
 	unsigned int	index;
 	unsigned int	offset;
 
 	if (!sd_buf)
 		return VM_FAULT_NOPAGE;
-	unitsz = (1U << sd_buf->order);
-	index  = vmf->pgoff / unitsz;
-	offset = vmf->pgoff % unitsz;
+	index  = vmf->pgoff / sd_buf->chunk_sz;
+	offset = vmf->pgoff % sd_buf->chunk_sz;
 	if (index >= sd_buf->nr_chunks)
 		return VM_FAULT_SIGBUS;
 
-	vmf->page = sd_buf->dma_chunks[index] + offset;
+	dma_page = sd_buf->dma_chunks[index] + offset;
+	get_page(dma_page);
+	vmf->page = dma_page;
 
 	return 0;
 }
@@ -2104,15 +2106,31 @@ static const struct vm_operations_struct strom_dma_buffer_vm_ops = {
 static int
 strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	strom_dma_buffer *sd_buf = filp->private_data;
+	strom_dma_buffer   *sd_buf = filp->private_data;
+	unsigned long		vm_len = vma->vm_end - vma->vm_start;
 
-	// only shared mapping is supported
-
-	// check range
-
+	/* sanity checks */
+	WARN_ON(vma->vm_file != filp);
+	/* available only if MAP_SHARED */
+	if ((vma->vm_flags & (VM_SHARED|VM_MAYSHARE)) == 0)
+	{
+		prError("Only MAP_SHARED is available on mmap(2) to Strom DMA Buffer");
+		return -EINVAL;
+	}
+	/* range has to be on the dma_chunks */
+	if ((vma->vm_pgoff << PAGE_SHIFT) + vm_len > sd_buf->length)
+	{
+		prError("vma (%p-%p on (%zu...%zu) is out of range (size=%zu)",
+				(void *)vma->vm_start,
+				(void *)vma->vm_end - 1,
+				(size_t)(vma->vm_pgoff << PAGE_SHIFT),
+				(size_t)(vm_len),
+				(size_t)(sd_buf->length));
+		return -EINVAL;
+	}
+	vma->vm_flags |= VM_IO;
 	vma->vm_ops = &strom_dma_buffer_vm_ops;
 	vma->vm_private_data = sd_buf;
-
 	return 0;
 }
 
@@ -2120,10 +2138,13 @@ static int
 strom_dma_buffer_release(struct inode *inode, struct file *filp)
 {
 	strom_dma_buffer *sd_buf = filp->private_data;
-	int		i;
+	int		i, j;
 
 	for (i=0; i < sd_buf->nr_chunks; i++)
-		__free_pages(sd_buf->dma_chunks[i], sd_buf->order);
+	{
+		for (j=0; j < sd_buf->chunk_sz; j++)
+			__free_page(sd_buf->dma_chunks[i] + j);
+	}
 	kfree(sd_buf);
 
 	return 0;
@@ -2142,42 +2163,64 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 {
 	StromCmd__AllocateDMABuffer karg;
 	strom_dma_buffer *sd_buf;
-	size_t			chunk_sz = (PAGE_SIZE << MAX_ORDER);
-	unsigned int	i, nr_chunks;
+	unsigned int	order = (MAX_ORDER - 1);
+	unsigned int	chunk_sz = (1U << order);
+	unsigned int	i, j, nr_chunks;
+	char			namebuf[80];
 	int				fdesc = -ENOMEM;
 
 	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocateDMABuffer)))
 		return -EFAULT;
 
 	/* sanity checks */
-	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) == 0)
+	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) != 0)
+	{
+		prError("DMA buffer length is 0 or unaligned (len=%zu)",
+				(size_t)karg.length);
 		return -EINVAL;
-	if (karg.node_id >= 0 && karg.node_id < nr_node_ids)
+	}
+	if (karg.node_id >= 0 && karg.node_id >= nr_node_ids)
+	{
+		prError("Numa node ID is out of range (node_id=%d)", karg.node_id);
 		return -EINVAL;
+	}
 
 	/* allocate DMA buffer from normal zone */
-	nr_chunks = (karg.length + chunk_sz - 1) / (chunk_sz);
+	nr_chunks = (karg.length + (chunk_sz << PAGE_SHIFT) - 1)
+							 / (chunk_sz << PAGE_SHIFT);
 	sd_buf = kzalloc(offsetof(strom_dma_buffer,
 							  dma_chunks[nr_chunks]), GFP_KERNEL);
 	if (!sd_buf)
 		return -ENOMEM;
 
+	sd_buf->length  = karg.length;
 	sd_buf->node_id = karg.node_id;
-	sd_buf->order = MAX_ORDER;
+	sd_buf->chunk_sz = chunk_sz;
 	sd_buf->nr_chunks = nr_chunks;
 	for (i=0; i < nr_chunks; i++)
 	{
-		sd_buf->dma_chunks[i] = alloc_pages_node(sd_buf->node_id,
-												 GFP_KERNEL,
-												 sd_buf->order);
-		if (!sd_buf->dma_chunks[i])
+		struct page *dma_chunk = alloc_pages_node(sd_buf->node_id,
+												  GFP_KERNEL,
+												  order);
+		if (!dma_chunk)
 			goto error;
+		split_page(dma_chunk, order);
+		sd_buf->dma_chunks[i] = dma_chunk;
 	}
 
 	/* construction of an anonymous file */
-	fdesc = anon_inode_getfd("strom-dma-buffer",
+	if (karg.length < (8UL << 20))
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuKB",
+				 sd_buf->node_id, (size_t)(karg.length >> 10));
+	else if (karg.length < (8UL << 30))
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuMB",
+				 sd_buf->node_id, (size_t)(karg.length >> 20));
+	else
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuGB",
+				 sd_buf->node_id, (size_t)(karg.length >> 30));
+	fdesc = anon_inode_getfd(namebuf,
 							 &strom_dma_buffer_fops,
-							 sd_buf, 0600);
+							 sd_buf, O_RDWR);
 	if (fdesc < 0)
 		goto error;
 	karg.dmabuf_fdesc = fdesc;
@@ -2197,7 +2240,10 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 
 error:
 	for (i=0; i < sd_buf->nr_chunks; i++)
-		__free_pages(sd_buf->dma_chunks[i], sd_buf->order);
+	{
+		for (j=0; j < sd_buf->chunk_sz; j++)
+			__free_page(sd_buf->dma_chunks[i] + j);
+	}
 	kfree(sd_buf);
 	return fdesc;
 }
