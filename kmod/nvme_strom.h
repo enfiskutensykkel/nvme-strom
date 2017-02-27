@@ -21,6 +21,10 @@ enum {
 	STROM_IOCTL__INFO_GPU_MEMORY			= _IO('S',0x84),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK	= _IO('S',0x90),
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT		= _IO('S',0x91),
+	STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC		= _IO('S',0x94),
+	STROM_IOCTL__MEMCPY_SSD2RAM_WAIT		= _IO('S',0x95),
+	STROM_IOCTL__ALLOCATE_DMA_BUFFER		= _IO('S',0x97),
+	STROM_IOCTL__RELEASE_DMA_BUFFER			= _IO('S',0x98),
 	STROM_IOCTL__STAT_INFO					= _IO('S',0x99),
 };
 
@@ -98,6 +102,38 @@ typedef struct StromCmd__MemCpySsdToGpuWait
 	unsigned long	dma_task_id;/* in: ID of the DMA task to wait */
 	long			status;		/* out: status of the DMA task */
 } StromCmd__MemCpySsdToGpuWait;
+
+/* STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC */
+typedef struct StromCmd__MemCpySsdToRamAsync
+{
+	unsigned long	dma_task_id;/* out: ID of the DMA task */
+	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
+	unsigned int	nr_ssd2ram; /* out: # of SSD2RAM chunks */
+
+	void __user	   *dest_addr;  /* in: virtual address of the destinatio
+								 *     buffer; which must be mapped using
+								 *     mmap(2) on /proc/nvme-strom */
+	int				file_desc;	/* in: file descriptor of the source file */
+	unsigned int	nr_chunks;	/* in: number of chunks */
+	unsigned int    chunk_sz;	/* in: chunk-size (BLCKSZ in PostgreSQL) */
+	uint32_t __user *chunk_ids;	/* in: # of chunks per file (RELSEG_SIZE in
+								 *     PostgreSQL). 0 means no boundary. */
+} StromCmd__MemCpySsdToRamAsync;
+
+/* STROM_IOCTL__MEMCPY_SSD2RAM_WAIT */
+typedef struct StromCmd__MemCpySsdToRamWait
+{
+	unsigned long	dma_task_id;/* in: ID of the DMA task to wait */
+	long			status;		/* out: status of the DMA task */
+} StromCmd__MemCpySsdToRamWait;
+
+/* STROM_IOCTL__ALLOCATE_DMA_BUFFER */
+typedef struct StromCmd__AllocateDMABuffer
+{
+	size_t			length;		/* in: required length of DMA buffer */
+	int				node_id;	/* in: numa-id to be located */
+	int				dmabuf_fdesc; /* out: FD of anon file descriptor */
+} StromCmd__AllocateDMABuffer;
 
 /* STROM_IOCTL__STAT_INFO */
 typedef struct StromCmd__StatInfo

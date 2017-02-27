@@ -16,8 +16,10 @@
  * GNU General Public License for more details.
  */
 #include <asm/uaccess.h>
+#include <linux/anon_inodes.h>
 #include <linux/blk-mq.h>
 #include <linux/buffer_head.h>
+#include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
@@ -2056,6 +2058,150 @@ out:
 	return retval;
 }
 
+/* ================================================================
+ *
+ * Routines to manage NUMA aware DMA buffer
+ *
+ * NOTE: STROM_IOCTL__ALLOCATE_DMA_BUFFER makes an anonymous file handler
+ * which allows application to mmap(2) preliminaty acquired NUMA aware DMA
+ * buffer on user space. Then, application can kick asynchronous DMA call
+ * onto the buffer.
+ * ================================================================ */
+struct strom_dma_buffer
+{
+	int				node_id;	/* NUMA node id */
+	unsigned int	order;		/* usually, MAX_ORDER */
+	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
+	struct page	   *dma_chunks[1];
+};
+typedef struct strom_dma_buffer		strom_dma_buffer;
+
+static int
+strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+	strom_dma_buffer *sd_buf = vma->vm_private_data;
+	unsigned int	unitsz;
+	unsigned int	index;
+	unsigned int	offset;
+
+	if (!sd_buf)
+		return VM_FAULT_NOPAGE;
+	unitsz = (1U << sd_buf->order);
+	index  = vmf->pgoff / unitsz;
+	offset = vmf->pgoff % unitsz;
+	if (index >= sd_buf->nr_chunks)
+		return VM_FAULT_SIGBUS;
+
+	vmf->page = sd_buf->dma_chunks[index] + offset;
+
+	return 0;
+}
+
+static const struct vm_operations_struct strom_dma_buffer_vm_ops = {
+	.fault		= strom_dma_buffer_fault,
+};
+
+static int
+strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	strom_dma_buffer *sd_buf = filp->private_data;
+
+	// only shared mapping is supported
+
+	// check range
+
+	vma->vm_ops = &strom_dma_buffer_vm_ops;
+	vma->vm_private_data = sd_buf;
+
+	return 0;
+}
+
+static int
+strom_dma_buffer_release(struct inode *inode, struct file *filp)
+{
+	strom_dma_buffer *sd_buf = filp->private_data;
+	int		i;
+
+	for (i=0; i < sd_buf->nr_chunks; i++)
+		__free_pages(sd_buf->dma_chunks[i], sd_buf->order);
+	kfree(sd_buf);
+
+	return 0;
+}
+
+static const struct file_operations strom_dma_buffer_fops = {
+	.mmap		= strom_dma_buffer_mmap,
+	.release	= strom_dma_buffer_release,
+};
+
+/*
+ * STROM_IOCTL__ALLOCATE_DMA_BUFFER
+ */
+static int
+ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
+{
+	StromCmd__AllocateDMABuffer karg;
+	strom_dma_buffer *sd_buf;
+	size_t			chunk_sz = (PAGE_SIZE << MAX_ORDER);
+	unsigned int	i, nr_chunks;
+	int				fdesc = -ENOMEM;
+
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocateDMABuffer)))
+		return -EFAULT;
+
+	/* sanity checks */
+	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) == 0)
+		return -EINVAL;
+	if (karg.node_id >= 0 && karg.node_id < nr_node_ids)
+		return -EINVAL;
+
+	/* allocate DMA buffer from normal zone */
+	nr_chunks = (karg.length + chunk_sz - 1) / (chunk_sz);
+	sd_buf = kzalloc(offsetof(strom_dma_buffer,
+							  dma_chunks[nr_chunks]), GFP_KERNEL);
+	if (!sd_buf)
+		return -ENOMEM;
+
+	sd_buf->node_id = karg.node_id;
+	sd_buf->order = MAX_ORDER;
+	sd_buf->nr_chunks = nr_chunks;
+	for (i=0; i < nr_chunks; i++)
+	{
+		sd_buf->dma_chunks[i] = alloc_pages_node(sd_buf->node_id,
+												 GFP_KERNEL,
+												 sd_buf->order);
+		if (!sd_buf->dma_chunks[i])
+			goto error;
+	}
+
+	/* construction of an anonymous file */
+	fdesc = anon_inode_getfd("strom-dma-buffer",
+							 &strom_dma_buffer_fops,
+							 sd_buf, 0600);
+	if (fdesc < 0)
+		goto error;
+	karg.dmabuf_fdesc = fdesc;
+
+	/* back to the userspace */
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocateDMABuffer)))
+	{
+		struct file *filp = fcheck(fdesc);
+
+		put_unused_fd(fdesc);
+		if (filp)
+			fput(filp);
+		fdesc = -EFAULT;
+		goto error;
+	}
+	return 0;
+
+error:
+	for (i=0; i < sd_buf->nr_chunks; i++)
+		__free_pages(sd_buf->dma_chunks[i], sd_buf->order);
+	kfree(sd_buf);
+	return fdesc;
+}
+
 /*
  * STROM_IOCTL__STAT_INFO
  */
@@ -2190,6 +2336,10 @@ strom_proc_ioctl(struct file *ioctl_filp,
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
 											   ioctl_filp);
+			break;
+
+		case STROM_IOCTL__ALLOCATE_DMA_BUFFER:
+			retval = ioctl_alloc_dma_buffer((void __user *) arg);
 			break;
 
 		case STROM_IOCTL__STAT_INFO:
