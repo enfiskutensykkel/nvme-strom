@@ -120,6 +120,8 @@ typedef struct StromCmd__MemCpySsdToRamAsync
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
 	unsigned int	nr_ssd2ram; /* out: # of SSD2RAM chunks */
+	unsigned int	nr_dma_submit;	/* out: # of SSD2GPU DMA submit */
+	unsigned int	nr_dma_blocks;	/* out: # of SSD2RAM DMA blocks */
 
 	void __user	   *dest_uaddr;	/* in: virtual address of the destination
 								 *     buffer; which must be mapped using
