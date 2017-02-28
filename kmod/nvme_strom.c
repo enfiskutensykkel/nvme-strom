@@ -967,6 +967,225 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
 
 /* ================================================================
  *
+ * Routines to manage NUMA aware DMA buffer
+ *
+ * NOTE: STROM_IOCTL__ALLOCATE_DMA_BUFFER makes an anonymous file handler
+ * which allows application to mmap(2) preliminaty acquired NUMA aware DMA
+ * buffer on user space. Then, application can kick asynchronous DMA call
+ * onto the buffer.
+ * ================================================================ */
+struct strom_dma_buffer
+{
+	size_t			length;		/* size required on allocation */
+	atomic_t		refcnt;		/* reference count */
+	int				node_id;	/* NUMA node id */
+	unsigned int	chunk_sz;	/* # of pages per chunk; (1UL<<(MAX_ORDER-1))*/
+	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
+	struct page	   *dma_chunks[1];
+};
+typedef struct strom_dma_buffer		strom_dma_buffer;
+
+/*
+ * get_strom_dma_buffer
+ */
+static strom_dma_buffer *
+get_strom_dma_buffer(strom_dma_buffer *sd_buf)
+{
+	int		refcnt		__attribute__((unused));
+
+	refcnt = atomic_inc_return(&sd_buf->refcnt);
+	Assert(refcnt > 1);
+	return sd_buf;
+}
+
+/*
+ * put_strom_dma_buffer
+ */
+static void
+put_strom_dma_buffer(strom_dma_buffer *sd_buf)
+{
+	if (atomic_dec_and_test(&sd_buf->refcnt))
+	{
+		int		i, j;
+
+		for (i=0; i < sd_buf->nr_chunks; i++)
+		{
+			for (j=0; j < sd_buf->chunk_sz; j++)
+				__free_page(sd_buf->dma_chunks[i] + j);
+		}
+		kfree(sd_buf);
+	}
+}
+
+/*
+ * strom_dma_buffer_fault - fault handler of DMA buffer
+ */
+static int
+strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+	strom_dma_buffer *sd_buf = vma->vm_private_data;
+	struct page	   *dma_page;
+	unsigned int	index;
+	unsigned int	offset;
+
+	if (!sd_buf)
+		return VM_FAULT_NOPAGE;
+	index  = vmf->pgoff / sd_buf->chunk_sz;
+	offset = vmf->pgoff % sd_buf->chunk_sz;
+	if (index >= sd_buf->nr_chunks)
+		return VM_FAULT_SIGBUS;
+
+	dma_page = sd_buf->dma_chunks[index] + offset;
+	get_page(dma_page);
+	vmf->page = dma_page;
+
+	return 0;
+}
+
+static const struct vm_operations_struct strom_dma_buffer_vm_ops = {
+	.fault		= strom_dma_buffer_fault,
+};
+
+static int
+strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	strom_dma_buffer   *sd_buf = filp->private_data;
+	unsigned long		vm_len = vma->vm_end - vma->vm_start;
+
+	/* sanity checks */
+	WARN_ON(vma->vm_file != filp);
+	/* available only if MAP_SHARED */
+	if ((vma->vm_flags & (VM_SHARED|VM_MAYSHARE)) == 0)
+	{
+		prError("Only MAP_SHARED is available on mmap(2) to Strom DMA Buffer");
+		return -EINVAL;
+	}
+	/* range has to be on the dma_chunks */
+	if ((vma->vm_pgoff << PAGE_SHIFT) + vm_len > sd_buf->length)
+	{
+		prError("vma (%p-%p on (%zu...%zu) is out of range (size=%zu)",
+				(void *)vma->vm_start,
+				(void *)vma->vm_end - 1,
+				(size_t)(vma->vm_pgoff << PAGE_SHIFT),
+				(size_t)(vm_len),
+				(size_t)(sd_buf->length));
+		return -EINVAL;
+	}
+	vma->vm_flags |= VM_IO;
+	vma->vm_ops = &strom_dma_buffer_vm_ops;
+	vma->vm_private_data = sd_buf;
+	return 0;
+}
+
+static int
+strom_dma_buffer_release(struct inode *inode, struct file *filp)
+{
+	put_strom_dma_buffer((strom_dma_buffer *) filp->private_data);
+
+	return 0;
+}
+
+static const struct file_operations strom_dma_buffer_fops = {
+	.mmap		= strom_dma_buffer_mmap,
+	.release	= strom_dma_buffer_release,
+};
+
+/*
+ * STROM_IOCTL__ALLOCATE_DMA_BUFFER
+ */
+static int
+ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
+{
+	StromCmd__AllocateDMABuffer karg;
+	strom_dma_buffer *sd_buf;
+	unsigned int	order = (MAX_ORDER - 1);
+	unsigned int	chunk_sz = (1U << order);
+	unsigned int	i, j, nr_chunks;
+	char			namebuf[80];
+	int				fdesc = -ENOMEM;
+
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocateDMABuffer)))
+		return -EFAULT;
+
+	/* sanity checks */
+	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) != 0)
+	{
+		prError("DMA buffer length is 0 or unaligned (len=%zu)",
+				(size_t)karg.length);
+		return -EINVAL;
+	}
+	if (karg.node_id >= 0 && karg.node_id >= nr_node_ids)
+	{
+		prError("Numa node ID is out of range (node_id=%d)", karg.node_id);
+		return -EINVAL;
+	}
+
+	/* allocate DMA buffer from normal zone */
+	nr_chunks = (karg.length + (chunk_sz << PAGE_SHIFT) - 1)
+							 / (chunk_sz << PAGE_SHIFT);
+	sd_buf = kzalloc(offsetof(strom_dma_buffer,
+							  dma_chunks[nr_chunks]), GFP_KERNEL);
+	if (!sd_buf)
+		return -ENOMEM;
+
+	sd_buf->length  = karg.length;
+	atomic_set(&sd_buf->refcnt, 1);
+	sd_buf->node_id = karg.node_id;
+	sd_buf->chunk_sz = chunk_sz;
+	sd_buf->nr_chunks = nr_chunks;
+	for (i=0; i < nr_chunks; i++)
+	{
+		struct page *dma_chunk = alloc_pages_node(sd_buf->node_id,
+												  GFP_KERNEL,
+												  order);
+		if (!dma_chunk)
+			goto error;
+		split_page(dma_chunk, order);
+		sd_buf->dma_chunks[i] = dma_chunk;
+	}
+
+	/* construction of an anonymous file */
+	if (karg.length < (8UL << 20))
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuKB",
+				 sd_buf->node_id, (size_t)(karg.length >> 10));
+	else if (karg.length < (8UL << 30))
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuMB",
+				 sd_buf->node_id, (size_t)(karg.length >> 20));
+	else
+		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuGB",
+				 sd_buf->node_id, (size_t)(karg.length >> 30));
+	fdesc = anon_inode_getfd(namebuf,
+							 &strom_dma_buffer_fops,
+							 sd_buf, O_RDWR);
+	if (fdesc < 0)
+		goto error;
+	karg.dmabuf_fdesc = fdesc;
+
+	/* back to the userspace */
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocateDMABuffer)))
+	{
+		struct file *filp = fcheck(fdesc);
+
+		put_unused_fd(fdesc);
+		if (filp)
+			fput(filp);
+		fdesc = -EFAULT;
+		goto error;
+	}
+	return 0;
+
+error:
+	for (i=0; i < sd_buf->nr_chunks; i++)
+	{
+		for (j=0; j < sd_buf->chunk_sz; j++)
+			__free_page(sd_buf->dma_chunks[i] + j);
+	}
+	kfree(sd_buf);
+	return fdesc;
+}
+
+/* ================================================================
+ *
  * Main part for SSD-to-GPU P2P DMA
  *
  * ================================================================
@@ -990,6 +1209,7 @@ struct strom_dma_task
 	atomic_t			refcnt;		/* reference counter */
 	bool				frozen;		/* (DEBUG) no longer newly referenced */
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
+	strom_dma_buffer   *sd_buf;		/* destination host mapped DMA buffer */
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
 	/* MD RAID-0 configuration, if any */
@@ -1044,11 +1264,11 @@ strom_dma_task_index(unsigned long dma_task_id)
  * strom_create_dma_task
  */
 static strom_dma_task *
-strom_create_dma_task(unsigned long handle,
-					  int fdesc,
+strom_create_dma_task(int fdesc,
+					  mapped_gpu_memory *mgmem,
+					  struct strom_dma_buffer *sd_buf,
 					  struct file *ioctl_filp)
 {
-	mapped_gpu_memory	   *mgmem;
 	strom_dma_task		   *dtask;
 	struct file			   *filp;
 	struct super_block	   *i_sb;
@@ -1059,44 +1279,43 @@ strom_create_dma_task(unsigned long handle,
 	long					retval;
 	unsigned long			flags;
 
+	/* either of GPU or Host memory can be destination */
+	Assert((mgmem != NULL && sd_buf == NULL) ||
+		   (mgmem == NULL && sd_buf != NULL));
+
 	/* ensure the source file is supported */
 	filp = fget(fdesc);
 	if (!filp)
 	{
 		prError("file descriptor %d of process %u is not available",
 				fdesc, current->tgid);
-		retval = -EBADF;
-		goto error_0;
+		return ERR_PTR(-EBADF);
 	}
 	retval = file_is_supported_nvme(filp,
 									&node_id,
 									&support_dma64,
 									&raid0_conf);
 	if (retval < 0)
-		goto error_1;
+	{
+		fput(filp);
+		return ERR_PTR(retval);
+	}
 	i_sb = filp->f_inode->i_sb;
 	s_bdev = i_sb->s_bdev;
-
-	/* get destination GPU memory */
-	mgmem = strom_get_mapped_gpu_memory(handle);
-	if (!mgmem)
-	{
-		retval = -ENOENT;
-		goto error_1;
-	}
 
 	/* allocate strom_dma_task object */
 	dtask = kzalloc(sizeof(strom_dma_task), GFP_KERNEL);
 	if (!dtask)
 	{
-		retval = -ENOMEM;
-		goto error_2;
+		fput(filp);
+		return ERR_PTR(-ENOMEM);
 	}
 	dtask->dma_task_id	= (unsigned long) dtask;
 	dtask->hindex		= strom_dma_task_index(dtask->dma_task_id);
     atomic_set(&dtask->refcnt, 1);
 	dtask->frozen		= false;
     dtask->mgmem		= mgmem;
+	dtask->sd_buf		= sd_buf;
     dtask->filp			= filp;
 	dtask->raid0_conf	= raid0_conf;
 	dtask->nvme_ns		= NULL;		/* to be set later */
@@ -1123,13 +1342,6 @@ strom_create_dma_task(unsigned long handle,
 	spin_unlock_irqrestore(&strom_dma_task_locks[dtask->hindex], flags);
 
 	return dtask;
-
-error_2:
-	strom_put_mapped_gpu_memory(mgmem);
-error_1:
-	fput(filp);
-error_0:
-	return ERR_PTR(retval);
 }
 
 /*
@@ -1167,10 +1379,11 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 
 	if (atomic_dec_and_test(&dtask->refcnt))
 	{
-		mapped_gpu_memory *mgmem = dtask->mgmem;
-		struct file	   *ioctl_filp = dtask->ioctl_filp;
-		struct file	   *data_filp = dtask->filp;
-		long			dma_status;
+		mapped_gpu_memory  *mgmem = dtask->mgmem;
+		strom_dma_buffer   *sd_buf = dtask->sd_buf;
+		struct file		   *ioctl_filp = dtask->ioctl_filp;
+		struct file		   *data_filp = dtask->filp;
+		long				dma_status;
 
 		if (!has_spinlock)
 			spin_lock_irqsave(&strom_dma_task_locks[hindex], flags);
@@ -1186,7 +1399,7 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 			dtask->ioctl_filp = NULL;
 			dtask->filp = NULL;
 			dtask->mgmem = NULL;
-
+			dtask->sd_buf = NULL;
 			list_add_tail_rcu(&dtask->chain, &failed_dma_task_slots[hindex]);
 		}
 		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
@@ -1196,7 +1409,10 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 		/* release the dtask object, if no error */
 		if (likely(!dma_status))
 			kfree(dtask);
-		strom_put_mapped_gpu_memory(mgmem);
+		if (mgmem)
+			strom_put_mapped_gpu_memory(mgmem);
+		if (sd_buf)
+			put_strom_dma_buffer(sd_buf);
 		fput(data_filp);
 		fput(ioctl_filp);
 
@@ -1603,8 +1819,6 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	length = nvme_page_size - (curr_paddr & (nvme_page_size - 1));
 	for (i=0; total_nbytes > 0; i++)
 	{
-		if (i == pitem->nrooms)
-			prNotice("pitem->nrooms=%u total_nbytes=%zu", pitem->nrooms, total_nbytes);
 		Assert(i < pitem->nrooms);
 		pitem->prps_list[i] = curr_paddr;
 		curr_paddr += length;
@@ -2048,10 +2262,11 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 							   struct file *ioctl_filp)
 {
 	StromCmd__MemCpySsdToGpuWriteBack karg;
-	strom_dma_task *dtask;
-	uint32_t	   *chunk_ids_in = NULL;
-	uint32_t	   *chunk_ids_out = NULL;
-	int				retval;
+	mapped_gpu_memory  *mgmem;
+	strom_dma_task	   *dtask;
+	uint32_t		   *chunk_ids_in = NULL;
+	uint32_t		   *chunk_ids_out = NULL;
+	int					retval;
 
 	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpuWriteBack)))
 		return -EFAULT;
@@ -2066,12 +2281,19 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	}
 	chunk_ids_out = chunk_ids_in + karg.nr_chunks;
 
-	/* setup DMA task */
-	dtask = strom_create_dma_task(karg.handle,
-								  karg.file_desc,
-								  ioctl_filp);
+	/* setup DMA task with mapped GPU memory */
+	mgmem = strom_get_mapped_gpu_memory(karg.handle);
+	if (!mgmem)
+	{
+		retval = -ENOENT;
+		goto out;
+	}
+
+	dtask = strom_create_dma_task(karg.file_desc,
+								  mgmem, NULL, ioctl_filp);
 	if (IS_ERR(dtask))
 	{
+		strom_put_mapped_gpu_memory(mgmem);
 		retval = PTR_ERR(dtask);
 		goto out;
 	}
@@ -2111,54 +2333,21 @@ out:
 
 /* ================================================================
  *
- * Routines to manage NUMA aware DMA buffer
+ * Main part for SSD-to-RAM Direct DMA
  *
- * NOTE: STROM_IOCTL__ALLOCATE_DMA_BUFFER makes an anonymous file handler
- * which allows application to mmap(2) preliminaty acquired NUMA aware DMA
- * buffer on user space. Then, application can kick asynchronous DMA call
- * onto the buffer.
- * ================================================================ */
-struct strom_dma_buffer
-{
-	size_t			length;		/* size required on allocation */
-	atomic_t		refcnt;		/* reference count */
-	int				node_id;	/* NUMA node id */
-	unsigned int	chunk_sz;	/* # of pages per chunk; (1UL<<(MAX_ORDER-1))*/
-	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
-	struct page	   *dma_chunks[1];
-};
-typedef struct strom_dma_buffer		strom_dma_buffer;
+ * ================================================================
+ */
 
 /*
- * get_strom_dma_buffer
+ * memcpy_ssd2ram_async - submit DMA requests
  */
-static strom_dma_buffer *
-get_strom_dma_buffer(strom_dma_buffer *sd_buf)
+static int
+memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync *karg,
+					 strom_dma_task *dtask, uint32_t *chunk_ids)
 {
-	int		refcnt		__attribute__((unused));
 
-	refcnt = atomic_inc_return(&sd_buf->refcnt);
-	Assert(refcnt > 1);
-	return sd_buf;
-}
 
-/*
- * put_strom_dma_buffer
- */
-static void
-put_strom_dma_buffer(strom_dma_buffer *sd_buf)
-{
-	if (atomic_dec_and_test(&sd_buf->refcnt))
-	{
-		int		i, j;
-
-		for (i=0; i < sd_buf->nr_chunks; i++)
-		{
-			for (j=0; j < sd_buf->chunk_sz; j++)
-				__free_page(sd_buf->dma_chunks[i] + j);
-		}
-		kfree(sd_buf);
-	}
+	return -EINVAL;
 }
 
 /*
@@ -2168,11 +2357,87 @@ static int
 ioctl_memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync __user *uarg,
 						   struct file *ioctl_filp)
 {
+	StromCmd__MemCpySsdToRamAsync karg;
+	struct vm_area_struct  *vma = NULL;
+	struct mm_struct	   *mm = current->mm;
+	strom_dma_buffer	   *sd_buf;
+	strom_dma_task		   *dtask;
+	uint32_t			   *chunk_ids;
+	unsigned long			dest_uaddr;
+	size_t					dest_len;
+	int						retval = 0;
 
-	// pick up sd_buf from vma
-	// enqueue dma request
+	/* copy ioctl arguments from the userspace */
+	if (copy_from_user(&karg, uarg, sizeof(karg)))
+		return -EFAULT;
+	chunk_ids = kmalloc(sizeof(uint32_t) * karg.nr_chunks, GFP_KERNEL);
+	if (!chunk_ids)
+		return -ENOMEM;
+	if (copy_from_user(chunk_ids, karg.chunk_ids,
+					   sizeof(uint32_t) * karg.nr_chunks))
+	{
+		retval = -EFAULT;
+		goto out;
+	}
 
-	return -EINVAL;
+	/*
+	 * lookup destination buffer; which should be mapped DMA buffer
+	 * and range is preliminary mapped to user application.
+	 */
+	down_read(&mm->mmap_sem);
+	dest_uaddr = (unsigned long)uarg->dest_uaddr;
+	dest_len = (size_t)karg.nr_chunks * (size_t)karg.chunk_sz;
+	vma = find_vma(mm, dest_uaddr);
+	if (!vma || !vma->vm_file ||
+		vma->vm_file->f_op != &strom_dma_buffer_fops)
+	{
+		up_read(&mm->mmap_sem);
+		retval = -EINVAL;
+		goto out;
+	}
+
+	if (dest_uaddr < vma->vm_start ||
+		dest_uaddr + dest_len > vma->vm_end)
+	{
+		up_read(&mm->mmap_sem);
+		retval = -ERANGE;
+		goto out;
+	}
+	sd_buf = get_strom_dma_buffer(vma->vm_private_data);
+	up_read(&mm->mmap_sem);
+
+	/* setup DMA task with mapped host DMA buffer */
+	dtask = strom_create_dma_task(karg.file_desc,
+								  NULL, sd_buf, ioctl_filp);
+	if (IS_ERR(dtask))
+	{
+		retval = PTR_ERR(dtask);
+		goto out;
+	}
+	karg.dma_task_id = dtask->dma_task_id;
+	karg.nr_ram2ram = 0;
+	karg.nr_ssd2ram = 0;
+
+	retval = memcpy_ssd2ram_async(&karg, dtask, chunk_ids);
+	/* no more async task shall acquire the @dtask any more */
+	dtask->frozen = true;
+	barrier();
+
+	//strom_put_dma_task(dtask, 0);
+
+	/* write back the results */
+	if (!retval)
+	{
+		if (copy_to_user(uarg, &karg,
+						 offsetof(StromCmd__MemCpySsdToRamAsync, dest_uaddr)))
+			retval = -EFAULT;
+	}
+	/* synchronization of completion if any error */
+	if (retval)
+		/* strom wait dma task */;
+out:
+	kfree(chunk_ids);
+	return retval;
 }
 
 /*
@@ -2183,173 +2448,6 @@ ioctl_memcpy_ssd2ram_wait(StromCmd__MemCpySsdToRamWait __user *uarg,
 						  struct file *ioctl_filp)
 {
 	return -EINVAL;
-}
-
-/*
- * strom_dma_buffer_fault - fault handler of DMA buffer
- */
-static int
-strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
-{
-	strom_dma_buffer *sd_buf = vma->vm_private_data;
-	struct page	   *dma_page;
-	unsigned int	index;
-	unsigned int	offset;
-
-	if (!sd_buf)
-		return VM_FAULT_NOPAGE;
-	index  = vmf->pgoff / sd_buf->chunk_sz;
-	offset = vmf->pgoff % sd_buf->chunk_sz;
-	if (index >= sd_buf->nr_chunks)
-		return VM_FAULT_SIGBUS;
-
-	dma_page = sd_buf->dma_chunks[index] + offset;
-	get_page(dma_page);
-	vmf->page = dma_page;
-
-	return 0;
-}
-
-static const struct vm_operations_struct strom_dma_buffer_vm_ops = {
-	.fault		= strom_dma_buffer_fault,
-};
-
-static int
-strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
-{
-	strom_dma_buffer   *sd_buf = filp->private_data;
-	unsigned long		vm_len = vma->vm_end - vma->vm_start;
-
-	/* sanity checks */
-	WARN_ON(vma->vm_file != filp);
-	/* available only if MAP_SHARED */
-	if ((vma->vm_flags & (VM_SHARED|VM_MAYSHARE)) == 0)
-	{
-		prError("Only MAP_SHARED is available on mmap(2) to Strom DMA Buffer");
-		return -EINVAL;
-	}
-	/* range has to be on the dma_chunks */
-	if ((vma->vm_pgoff << PAGE_SHIFT) + vm_len > sd_buf->length)
-	{
-		prError("vma (%p-%p on (%zu...%zu) is out of range (size=%zu)",
-				(void *)vma->vm_start,
-				(void *)vma->vm_end - 1,
-				(size_t)(vma->vm_pgoff << PAGE_SHIFT),
-				(size_t)(vm_len),
-				(size_t)(sd_buf->length));
-		return -EINVAL;
-	}
-	vma->vm_flags |= VM_IO;
-	vma->vm_ops = &strom_dma_buffer_vm_ops;
-	vma->vm_private_data = sd_buf;
-	return 0;
-}
-
-static int
-strom_dma_buffer_release(struct inode *inode, struct file *filp)
-{
-	put_strom_dma_buffer((strom_dma_buffer *) filp->private_data);
-
-	return 0;
-}
-
-static const struct file_operations strom_dma_buffer_fops = {
-	.mmap		= strom_dma_buffer_mmap,
-	.release	= strom_dma_buffer_release,
-};
-
-/*
- * STROM_IOCTL__ALLOCATE_DMA_BUFFER
- */
-static int
-ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
-{
-	StromCmd__AllocateDMABuffer karg;
-	strom_dma_buffer *sd_buf;
-	unsigned int	order = (MAX_ORDER - 1);
-	unsigned int	chunk_sz = (1U << order);
-	unsigned int	i, j, nr_chunks;
-	char			namebuf[80];
-	int				fdesc = -ENOMEM;
-
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocateDMABuffer)))
-		return -EFAULT;
-
-	/* sanity checks */
-	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) != 0)
-	{
-		prError("DMA buffer length is 0 or unaligned (len=%zu)",
-				(size_t)karg.length);
-		return -EINVAL;
-	}
-	if (karg.node_id >= 0 && karg.node_id >= nr_node_ids)
-	{
-		prError("Numa node ID is out of range (node_id=%d)", karg.node_id);
-		return -EINVAL;
-	}
-
-	/* allocate DMA buffer from normal zone */
-	nr_chunks = (karg.length + (chunk_sz << PAGE_SHIFT) - 1)
-							 / (chunk_sz << PAGE_SHIFT);
-	sd_buf = kzalloc(offsetof(strom_dma_buffer,
-							  dma_chunks[nr_chunks]), GFP_KERNEL);
-	if (!sd_buf)
-		return -ENOMEM;
-
-	sd_buf->length  = karg.length;
-	atomic_set(&sd_buf->refcnt, 1);
-	sd_buf->node_id = karg.node_id;
-	sd_buf->chunk_sz = chunk_sz;
-	sd_buf->nr_chunks = nr_chunks;
-	for (i=0; i < nr_chunks; i++)
-	{
-		struct page *dma_chunk = alloc_pages_node(sd_buf->node_id,
-												  GFP_KERNEL,
-												  order);
-		if (!dma_chunk)
-			goto error;
-		split_page(dma_chunk, order);
-		sd_buf->dma_chunks[i] = dma_chunk;
-	}
-
-	/* construction of an anonymous file */
-	if (karg.length < (8UL << 20))
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuKB",
-				 sd_buf->node_id, (size_t)(karg.length >> 10));
-	else if (karg.length < (8UL << 30))
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuMB",
-				 sd_buf->node_id, (size_t)(karg.length >> 20));
-	else
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuGB",
-				 sd_buf->node_id, (size_t)(karg.length >> 30));
-	fdesc = anon_inode_getfd(namebuf,
-							 &strom_dma_buffer_fops,
-							 sd_buf, O_RDWR);
-	if (fdesc < 0)
-		goto error;
-	karg.dmabuf_fdesc = fdesc;
-
-	/* back to the userspace */
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocateDMABuffer)))
-	{
-		struct file *filp = fcheck(fdesc);
-
-		put_unused_fd(fdesc);
-		if (filp)
-			fput(filp);
-		fdesc = -EFAULT;
-		goto error;
-	}
-	return 0;
-
-error:
-	for (i=0; i < sd_buf->nr_chunks; i++)
-	{
-		for (j=0; j < sd_buf->chunk_sz; j++)
-			__free_page(sd_buf->dma_chunks[i] + j);
-	}
-	kfree(sd_buf);
-	return fdesc;
 }
 
 /*

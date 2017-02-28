@@ -121,12 +121,14 @@ typedef struct StromCmd__MemCpySsdToRamAsync
 	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
 	unsigned int	nr_ssd2ram; /* out: # of SSD2RAM chunks */
 
-	void __user	   *dest_addr;  /* in: virtual address of the destination
+	void __user	   *dest_uaddr;	/* in: virtual address of the destination
 								 *     buffer; which must be mapped using
 								 *     mmap(2) on /proc/nvme-strom */
 	int				file_desc;	/* in: file descriptor of the source file */
 	unsigned int	nr_chunks;	/* in: number of chunks */
 	unsigned int    chunk_sz;	/* in: chunk-size (BLCKSZ in PostgreSQL) */
+	unsigned int	relseg_sz;	/* in: # of chunks per file. (RELSEG_SIZE
+								 *     in PostgreSQL). 0 means no boundary. */
 	uint32_t __user *chunk_ids;	/* in: # of chunks per file (RELSEG_SIZE in
 								 *     PostgreSQL). 0 means no boundary. */
 } StromCmd__MemCpySsdToRamAsync;
