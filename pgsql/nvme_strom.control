@@ -1,0 +1,5 @@
+# nvme_strom extension
+comment = 'NVMe-Strom -- fast table scan using NVMe-SSD direct load'
+default_version = '1.0'
+module_pathname = '$libdir/nvme_strom'
+relocatable = false
