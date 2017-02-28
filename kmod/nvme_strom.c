@@ -646,11 +646,16 @@ strom_get_block(struct inode *inode, sector_t iblock,
  * __extblock_is_supported_nvme - checker for BLOCK_EXT_MAJOR
  */
 static int
-__extblock_is_supported_nvme(struct block_device *blkdev)
+__extblock_is_supported_nvme(struct block_device *blkdev,
+							 int *p_numa_node_id,
+							 int *p_support_dma64)
 {
-	struct gendisk *bd_disk = blkdev->bd_disk;
-	const char	   *dname;
-	int				rc;
+	struct gendisk	   *bd_disk = blkdev->bd_disk;
+	struct nvme_ns	   *nvme_ns = (struct nvme_ns *)bd_disk->private_data;
+	struct nvme_ctrl   *nvme_ctrl = nvme_ns->ctrl;
+	struct device	   *this_dev = nvme_ctrl->dev;
+	const char		   *dname;
+	int					rc;
 
 	/* 'devext' is wrapper of NVMe-SSD device */
 	if (bd_disk->major != BLOCK_EXT_MAJOR)
@@ -704,6 +709,28 @@ __extblock_is_supported_nvme(struct block_device *blkdev)
 				bd_disk->disk_name, rc);
 		return -ENOTSUPP;
 	}
+
+	/* Inform PCIe topolocy where the SSD device locates on */
+	if (p_numa_node_id)
+	{
+#ifdef CONFIG_NUMA
+		if (*p_numa_node_id < -1)
+			*p_numa_node_id = this_dev->numa_node;
+		else if (*p_numa_node_id > -1 &&
+				 *p_numa_node_id != this_dev->numa_node)
+			*p_numa_node_id = -1;
+#else
+		*p_numa_node_id = -1;
+#endif
+	}
+
+	/* Check range of DMA destination address of the SSD device */
+	if (p_support_dma64)
+	{
+		if (!this_dev->dma_mask ||
+			*this_dev->dma_mask != DMA_BIT_MASK(64))
+			*p_support_dma64 = 0;
+	}
 	return 0;	/* OK, we can assume this volume is raw NVMe-SSD */
 }
 
@@ -712,6 +739,8 @@ __extblock_is_supported_nvme(struct block_device *blkdev)
  */
 static int
 __mdblock_is_supported_nvme(struct block_device *blkdev,
+							int *p_numa_node_id,
+							int *p_support_dma64,
 							struct r0conf **p_raid0_conf)
 {
 	struct gendisk *bd_disk = blkdev->bd_disk;
@@ -783,7 +812,9 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	/* check for each underlying devices */
 	rdev_for_each(rdev, mddev)
 	{
-		rc = __extblock_is_supported_nvme(rdev->bdev);
+		rc = __extblock_is_supported_nvme(rdev->bdev,
+										  p_numa_node_id,
+										  p_support_dma64);
 		if (rc)
 		{
 			prError("md-device '%s' - disk[%d] is not NVMe-SSD",
@@ -803,7 +834,9 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
  * file_is_supported_nvme
  */
 static int
-file_is_supported_nvme(struct file *filp, bool is_writable,
+file_is_supported_nvme(struct file *filp,
+					   int *p_numa_node_id,
+					   int *p_support_dma64,
 					   struct r0conf **p_raid0_conf)
 {
 	struct inode	   *f_inode = filp->f_inode;
@@ -815,7 +848,7 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	/*
 	 * must have proper permission to the target file
 	 */
-	if ((filp->f_mode & (is_writable ? FMODE_WRITE : FMODE_READ)) == 0)
+	if ((filp->f_mode & FMODE_READ) == 0)
 	{
 		prError("process (pid=%u) has no permission to read file",
 				current->pid);
@@ -865,18 +898,15 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	 * Contents of these files are stored with inode, instead of separate
 	 * data blocks. It usually makes no sense on SSD-to-GPU Direct fature.
 	 */
-	if (!is_writable)
+	spin_lock(&f_inode->i_lock);
+	if (f_inode->i_size < PAGE_SIZE)
 	{
-		spin_lock(&f_inode->i_lock);
-		if (f_inode->i_size < PAGE_SIZE)
-		{
-			size_t		i_size = f_inode->i_size;
-			spin_unlock(&f_inode->i_lock);
-			prError("file size too small (%zu bytes), not suitable", i_size);
-			return -ENOTSUPP;
-		}
+		size_t		i_size = f_inode->i_size;
 		spin_unlock(&f_inode->i_lock);
+		prError("file size too small (%zu bytes), not suitable", i_size);
+		return -ENOTSUPP;
 	}
+	spin_unlock(&f_inode->i_lock);
 
 	/*
 	 * check whether the block device is either of:
@@ -884,9 +914,14 @@ file_is_supported_nvme(struct file *filp, bool is_writable,
 	 * 2. logical MD RAID-0 device which consists of only NVMe-SSDs
 	 */
 	if (bd_disk->major == BLOCK_EXT_MAJOR)
-		return __extblock_is_supported_nvme(s_bdev);
+		return __extblock_is_supported_nvme(s_bdev,
+											p_numa_node_id,
+											p_support_dma64);
 	else if (bd_disk->major == MD_MAJOR)
-		return __mdblock_is_supported_nvme(s_bdev, p_raid0_conf);
+		return __mdblock_is_supported_nvme(s_bdev,
+										   p_numa_node_id,
+										   p_support_dma64,
+										   p_raid0_conf);
 
 	prError("block device '%s' on behalf of the file is not supported",
 			bd_disk->disk_name);
@@ -903,6 +938,8 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
 {
 	StromCmd__CheckFile karg;
 	struct file	   *filp;
+	int				numa_node_id = -2;
+	int				support_dma64 = 1;
 	int				rc;
 
 	if (copy_from_user(&karg, uarg, sizeof(karg)))
@@ -912,10 +949,19 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
 	if (!filp)
 		return -EBADF;
 
-	rc = file_is_supported_nvme(filp, false, NULL);
-
+	rc = file_is_supported_nvme(filp,
+								&numa_node_id,
+								&support_dma64,
+								NULL);
 	fput(filp);
 
+	if (rc == 0)
+	{
+		karg.numa_node_id	= numa_node_id;
+		karg.support_dma64	= support_dma64;
+		if (copy_to_user(uarg, &karg, sizeof(karg)))
+			rc = -EFAULT;
+	}
 	return (rc < 0 ? rc : 0);
 }
 
@@ -1008,6 +1054,8 @@ strom_create_dma_task(unsigned long handle,
 	struct super_block	   *i_sb;
 	struct block_device	   *s_bdev;
 	struct r0conf		   *raid0_conf = NULL;
+	int						node_id = -2;
+	int						support_dma64 = 1;
 	long					retval;
 	unsigned long			flags;
 
@@ -1020,7 +1068,10 @@ strom_create_dma_task(unsigned long handle,
 		retval = -EBADF;
 		goto error_0;
 	}
-	retval = file_is_supported_nvme(filp, false, &raid0_conf);
+	retval = file_is_supported_nvme(filp,
+									&node_id,
+									&support_dma64,
+									&raid0_conf);
 	if (retval < 0)
 		goto error_1;
 	i_sb = filp->f_inode->i_sb;

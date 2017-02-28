@@ -36,6 +36,16 @@ enum {
 typedef struct StromCmd__CheckFile
 {
 	int				fdesc;		/* in: file descriptor to be checked */
+	int				numa_node_id;/* out: NUMA node-id where the storage
+								  *      device is installed. It can be -1,
+								  *      if md-raid0 stripes SSDs on multiple
+								  *      NUMA nodes.
+								  */
+	int				support_dma64;/* out: non-zero, if source SSD device
+								   *      supports 64bit DMA; which means
+								   *      Numa aware SSD2RAM DMA is also
+								   *      supported.
+								   */
 } StromCmd__CheckFile;
 
 /* STROM_IOCTL__MAP_GPU_MEMORY */

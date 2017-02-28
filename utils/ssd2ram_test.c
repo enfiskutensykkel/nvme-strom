@@ -14,8 +14,32 @@
 #include <unistd.h>
 #include "utils_common.h"
 
+static char	   *source_filename = NULL;
 static int		numa_node_id = 0;
+static int		enable_checks = 0;
 static size_t	buffer_size = (32UL << 20);		/* 32MB in default */
+
+/*
+ * Run STROM_IOCTL__CHECK_FILE
+ */
+static void
+run_ioctl_check_file(int fdesc)
+{
+	StromCmd__CheckFile uarg;
+
+	memset(&uarg, 0, sizeof(uarg));
+    uarg.fdesc = fdesc;
+
+	if (nvme_strom_ioctl(STROM_IOCTL__CHECK_FILE, &uarg))
+		ELOG(errno, "failed on ioctl(STROM_IOCTL__CHECK_FILE, '%s')",
+			 source_filename);
+
+	printf("file: %s, numa-id: %d, DMA64: %s\n",
+		   source_filename,
+		   uarg.numa_node_id,
+		   uarg.support_dma64 ? "supported" : "unsupported");
+}
+
 
 
 static void *
@@ -51,7 +75,8 @@ static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-			"usage: %s [OPTIONS]\n"
+			"usage: %s [OPTIONS] <filename>\n"
+			"  -c : check SSD2RAM capability of the file\n"
 			"  -n <numa node>\n"
 			"  -s <buffer size in MB>\n",
 			basename(strdup(argv0)));
@@ -61,13 +86,16 @@ usage(const char *argv0)
 int
 main(int argc, char *argv[])
 {
-	int		c;
 	void   *buffer;
+	int		c, fdesc;
 
-	while ((c = getopt(argc, argv, "n:s:h")) >= 0)
+	while ((c = getopt(argc, argv, "cn:s:h")) >= 0)
 	{
 		switch (c)
 		{
+			case 'c':
+				enable_checks = 1;
+				break;
 			case 'n':
 				numa_node_id = atoi(optarg);
 				break;
@@ -80,11 +108,23 @@ main(int argc, char *argv[])
 		}
 
 	}
-#if 0
 	if (optind + 1 != argc)
 		usage(argv[0]);
-	filename = argv[optind];
-#endif
+	source_filename = argv[optind];
+	fdesc = open(source_filename, O_RDONLY);
+	if (fdesc < 0)
+		ELOG(errno, "failed on open('%s')", source_filename);
+
+	/* Run STROM_IOCTL__CHECK_FILE only */
+	if (enable_checks)
+	{
+		run_ioctl_check_file(fdesc);
+		return 0;
+	}
+
+
+
+
 	buffer = alloc_dma_buffer();
 
 	printf("mapped on %p\n", buffer);
