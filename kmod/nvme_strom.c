@@ -979,9 +979,9 @@ struct strom_dma_buffer
 	size_t			length;		/* size required on allocation */
 	atomic_t		refcnt;		/* reference count */
 	int				node_id;	/* NUMA node id */
-	unsigned int	chunk_sz;	/* # of pages per chunk; (1UL<<(MAX_ORDER-1))*/
-	unsigned int	nr_chunks;	/* # of DMA chunks with (1UL<<order) pages */
-	struct page	   *dma_chunks[1];
+	unsigned int	segment_sz;	/* # of pages per DMA segment */
+	unsigned int	nr_segments;/* # of DMA segments */
+	struct page	   *dma_segments[1];
 };
 typedef struct strom_dma_buffer		strom_dma_buffer;
 
@@ -1008,10 +1008,10 @@ put_strom_dma_buffer(strom_dma_buffer *sd_buf)
 	{
 		int		i, j;
 
-		for (i=0; i < sd_buf->nr_chunks; i++)
+		for (i=0; i < sd_buf->nr_segments; i++)
 		{
-			for (j=0; j < sd_buf->chunk_sz; j++)
-				__free_page(sd_buf->dma_chunks[i] + j);
+			for (j=0; j < sd_buf->segment_sz; j++)
+				__free_page(sd_buf->dma_segments[i] + j);
 		}
 		kfree(sd_buf);
 	}
@@ -1030,12 +1030,12 @@ strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 
 	if (!sd_buf)
 		return VM_FAULT_NOPAGE;
-	index  = vmf->pgoff / sd_buf->chunk_sz;
-	offset = vmf->pgoff % sd_buf->chunk_sz;
-	if (index >= sd_buf->nr_chunks)
+	index  = vmf->pgoff / sd_buf->segment_sz;
+	offset = vmf->pgoff % sd_buf->segment_sz;
+	if (index >= sd_buf->nr_segments)
 		return VM_FAULT_SIGBUS;
 
-	dma_page = sd_buf->dma_chunks[index] + offset;
+	dma_page = sd_buf->dma_segments[index] + offset;
 	get_page(dma_page);
 	vmf->page = dma_page;
 
@@ -1060,7 +1060,7 @@ strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
 		prError("Only MAP_SHARED is available on mmap(2) to Strom DMA Buffer");
 		return -EINVAL;
 	}
-	/* range has to be on the dma_chunks */
+	/* range must be contained in the physical DMA buffer pages */
 	if ((vma->vm_pgoff << PAGE_SHIFT) + vm_len > sd_buf->length)
 	{
 		prError("vma (%p-%p on (%zu...%zu) is out of range (size=%zu)",
@@ -1099,8 +1099,8 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 	StromCmd__AllocateDMABuffer karg;
 	strom_dma_buffer *sd_buf;
 	unsigned int	order = (MAX_ORDER - 1);
-	unsigned int	chunk_sz = (1U << order);
-	unsigned int	i, j, nr_chunks;
+	unsigned int	segment_sz = (1U << order);
+	unsigned int	i, j, nr_segments;
 	char			namebuf[80];
 	int				fdesc = -ENOMEM;
 
@@ -1121,27 +1121,27 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 	}
 
 	/* allocate DMA buffer from normal zone */
-	nr_chunks = (karg.length + (chunk_sz << PAGE_SHIFT) - 1)
-							 / (chunk_sz << PAGE_SHIFT);
+	nr_segments = (karg.length + (segment_sz << PAGE_SHIFT) - 1)
+							   / (segment_sz << PAGE_SHIFT);
 	sd_buf = kzalloc(offsetof(strom_dma_buffer,
-							  dma_chunks[nr_chunks]), GFP_KERNEL);
+							  dma_segments[nr_segments]), GFP_KERNEL);
 	if (!sd_buf)
 		return -ENOMEM;
 
 	sd_buf->length  = karg.length;
 	atomic_set(&sd_buf->refcnt, 1);
 	sd_buf->node_id = karg.node_id;
-	sd_buf->chunk_sz = chunk_sz;
-	sd_buf->nr_chunks = nr_chunks;
-	for (i=0; i < nr_chunks; i++)
+	sd_buf->segment_sz = segment_sz;
+	sd_buf->nr_segments = nr_segments;
+	for (i=0; i < nr_segments; i++)
 	{
-		struct page *dma_chunk = alloc_pages_node(sd_buf->node_id,
-												  GFP_KERNEL,
-												  order);
-		if (!dma_chunk)
+		struct page *dma_segment = alloc_pages_node(sd_buf->node_id,
+													GFP_KERNEL,
+													order);
+		if (!dma_segment)
 			goto error;
-		split_page(dma_chunk, order);
-		sd_buf->dma_chunks[i] = dma_chunk;
+		split_page(dma_segment, order);
+		sd_buf->dma_segments[i] = dma_segment;
 	}
 
 	/* construction of an anonymous file */
@@ -1175,10 +1175,10 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 	return 0;
 
 error:
-	for (i=0; i < sd_buf->nr_chunks; i++)
+	for (i=0; i < sd_buf->nr_segments; i++)
 	{
-		for (j=0; j < sd_buf->chunk_sz; j++)
-			__free_page(sd_buf->dma_chunks[i] + j);
+		for (j=0; j < sd_buf->segment_sz; j++)
+			__free_page(sd_buf->dma_segments[i] + j);
 	}
 	kfree(sd_buf);
 	return fdesc;
@@ -2381,7 +2381,8 @@ memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync *karg,
 					   (size_t)karg->nr_chunks) > sd_buf->length)
 		return -ERANGE;
 
-	dest_segment_sz = (size_t)sd_buf->chunk_sz * (size_t)sd_buf->nr_chunks;
+	dest_segment_sz = ((size_t)sd_buf->segment_sz *
+					   (size_t)sd_buf->nr_segments);
 	i_size = i_size_read(f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
 	{
