@@ -1084,75 +1084,6 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	return 0;
 }
 
-static int
-submit_ssd2gpu_memcpy(strom_dma_task *dtask)
-{
-	mapped_gpu_memory  *mgmem = dtask->mgmem;
-	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
-	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
-	strom_prps_item	   *pitem;
-	ssize_t				total_nbytes;
-	dma_addr_t			curr_paddr;
-	int					length;
-	int					i, retval;
-	u32					nvme_page_size = nvme_ns->ctrl->page_size;
-	u64					tv1, tv2;
-
-	/* sanity checks */
-	Assert(nvme_ns != NULL);
-	WARN_ON(nvme_page_size < PAGE_SIZE);
-
-	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
-	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
-		return -EINVAL;
-	if (dtask->dest_offset < mgmem->map_offset ||
-		dtask->dest_offset + total_nbytes > (mgmem->map_offset +
-											 mgmem->map_length))
-		return -ERANGE;
-
-	tv1 = rdtsc();
-	pitem = strom_prps_item_alloc();
-	if (!pitem)
-		return -ENOMEM;
-
-	i =  (dtask->dest_offset >> mgmem->gpu_page_shift);
-	curr_paddr = (page_table->pages[i]->physical_address +
-				  (dtask->dest_offset & (mgmem->gpu_page_sz - 1)));
-	length = nvme_page_size - (curr_paddr & (nvme_page_size - 1));
-	for (i=0; total_nbytes > 0; i++)
-	{
-		Assert(i < pitem->nrooms);
-		pitem->prps_list[i] = curr_paddr;
-		curr_paddr += length;
-		total_nbytes -= length;
-
-		length = Min(total_nbytes, nvme_page_size);
-	}
-	pitem->nitems = i;
-	if (stat_info)
-	{
-		tv2 = rdtsc();
-		atomic64_inc(&stat_nr_setup_prps);
-		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_setup_prps);
-	}
-
-	tv1 = rdtsc();
-	retval = __submit_async_read_cmd(dtask, pitem);
-	if (retval)
-		strom_prps_item_free(pitem);
-	if (stat_info)
-	{
-		long	curval;
-
-		tv2 = rdtsc();
-		atomic64_inc(&stat_nr_submit_dma);
-		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_submit_dma);
-
-		curval = atomic64_inc_return(&stat_cur_dma_count);
-		atomic64_max_return(curval, &stat_max_dma_count);
-	}
-	return retval;
-}
 
 /*
  * strom_memcpy_ssd2gpu_wait - synchronization of a dma_task
@@ -1434,6 +1365,83 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 			dtask->nr_sectors  = nr_sects;
 		}
 		curr_offset += PAGE_CACHE_SIZE;
+	}
+	return retval;
+}
+
+
+/* ================================================================
+ *
+ * Routines to support SSD-to-GPU (Host mapped GPU device memory)
+ *
+ * ================================================================
+ */
+static int
+submit_ssd2gpu_memcpy(strom_dma_task *dtask)
+{
+	mapped_gpu_memory  *mgmem = dtask->mgmem;
+	nvidia_p2p_page_table_t *page_table = mgmem->page_table;
+	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
+	strom_prps_item	   *pitem;
+	ssize_t				total_nbytes;
+	dma_addr_t			curr_paddr;
+	int					length;
+	int					i, retval;
+	u32					nvme_page_size = nvme_ns->ctrl->page_size;
+	u64					tv1, tv2;
+
+	/* sanity checks */
+	Assert(nvme_ns != NULL);
+	WARN_ON(nvme_page_size < PAGE_SIZE);
+
+	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
+	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
+		return -EINVAL;
+	if (dtask->dest_offset < mgmem->map_offset ||
+		dtask->dest_offset + total_nbytes > (mgmem->map_offset +
+											 mgmem->map_length))
+		return -ERANGE;
+
+	tv1 = rdtsc();
+	pitem = strom_prps_item_alloc();
+	if (!pitem)
+		return -ENOMEM;
+
+	i =  (dtask->dest_offset >> mgmem->gpu_page_shift);
+	curr_paddr = (page_table->pages[i]->physical_address +
+				  (dtask->dest_offset & (mgmem->gpu_page_sz - 1)));
+	length = nvme_page_size - (curr_paddr & (nvme_page_size - 1));
+	for (i=0; total_nbytes > 0; i++)
+	{
+		Assert(i < pitem->nrooms);
+		pitem->prps_list[i] = curr_paddr;
+		curr_paddr += length;
+		total_nbytes -= length;
+
+		length = Min(total_nbytes, nvme_page_size);
+	}
+	pitem->nitems = i;
+	if (stat_info)
+	{
+		tv2 = rdtsc();
+		atomic64_inc(&stat_nr_setup_prps);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_setup_prps);
+	}
+
+	tv1 = rdtsc();
+	retval = __submit_async_read_cmd(dtask, pitem);
+	if (retval)
+		strom_prps_item_free(pitem);
+	if (stat_info)
+	{
+		long	curval;
+
+		tv2 = rdtsc();
+		atomic64_inc(&stat_nr_submit_dma);
+		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_submit_dma);
+
+		curval = atomic64_inc_return(&stat_cur_dma_count);
+		atomic64_max_return(curval, &stat_max_dma_count);
 	}
 	return retval;
 }
