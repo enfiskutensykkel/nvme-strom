@@ -31,8 +31,8 @@ USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
 
 EXTRA_CLEAN := nvme_test nvme_stat
 
-KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c		\
-		nvme_strom.rhel7.c md.rhel7.h raid0.rhel7.h
+KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c pmemmap.c \
+	$(shell ls $(M)/*/md.h $(M)/*/raid0.h $(M)/*/nvme.h)
 
 obj-m := nvme_strom.o
 ccflags-y := -I. -I$(NVIDIA_SOURCE) 				\
