@@ -1639,15 +1639,6 @@ out:
 
 #include "ssd2ram.c"
 
-/*
- * ioctl_memcpy_ssd2ram_wait - handler for STROM_IOCTL__MEMCPY_SSD2RAM_WAIT
- */
-static int
-ioctl_memcpy_ssd2ram_wait(StromCmd__MemCpySsdToRamWait __user *uarg,
-						  struct file *ioctl_filp)
-{
-	return -EINVAL;
-}
 
 /*
  * STROM_IOCTL__STAT_INFO
@@ -1781,6 +1772,7 @@ strom_proc_ioctl(struct file *ioctl_filp,
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
+		case STROM_IOCTL__MEMCPY_SSD2RAM_WAIT:	/* same logic */
 			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
 											   ioctl_filp);
 			break;
@@ -1790,12 +1782,7 @@ strom_proc_ioctl(struct file *ioctl_filp,
 												ioctl_filp);
 			break;
 
-		case STROM_IOCTL__MEMCPY_SSD2RAM_WAIT:
-			retval = ioctl_memcpy_ssd2ram_wait((void __user *) arg,
-											   ioctl_filp);
-			break;
-
-		case STROM_IOCTL__ALLOCATE_DMA_BUFFER:
+		case STROM_IOCTL__ALLOC_DMA_BUFFER:
 			retval = ioctl_alloc_dma_buffer((void __user *) arg);
 			break;
 

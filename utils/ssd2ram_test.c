@@ -45,15 +45,15 @@ run_ioctl_check_file(int fdesc)
 static void *
 alloc_dma_buffer(void)
 {
-	StromCmd__AllocateDMABuffer cmd;
+	StromCmd__AllocDMABuffer cmd;
 	void	   *buffer;
 
-	memset(&cmd, 0, sizeof(StromCmd__AllocateDMABuffer));
+	memset(&cmd, 0, sizeof(StromCmd__AllocDMABuffer));
 	cmd.length = buffer_size;
 	cmd.node_id = numa_node_id;
 
-	if (nvme_strom_ioctl(STROM_IOCTL__ALLOCATE_DMA_BUFFER, &cmd))
-		ELOG(errno, "failed on ioctl(STROM_IOCTL__ALLOCATE_DMA_BUFFER)");
+	if (nvme_strom_ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER, &cmd))
+		ELOG(errno, "failed on ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER)");
 
 	printf("DMA buffer on FD=%d\n", cmd.dmabuf_fdesc);
 

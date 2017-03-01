@@ -623,9 +623,9 @@ static const struct file_operations strom_dma_buffer_fops = {
  * STROM_IOCTL__ALLOCATE_DMA_BUFFER
  */
 static int
-ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
+ioctl_alloc_dma_buffer(StromCmd__AllocDMABuffer __user *uarg)
 {
-	StromCmd__AllocateDMABuffer karg;
+	StromCmd__AllocDMABuffer karg;
 	strom_dma_buffer *sd_buf;
 	unsigned int	order = (MAX_ORDER - 1);
 	unsigned int	segment_sz = (1U << order);
@@ -633,7 +633,7 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 	char			namebuf[80];
 	int				fdesc = -ENOMEM;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocateDMABuffer)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocDMABuffer)))
 		return -EFAULT;
 
 	/* sanity checks */
@@ -691,7 +691,7 @@ ioctl_alloc_dma_buffer(StromCmd__AllocateDMABuffer __user *uarg)
 	karg.dmabuf_fdesc = fdesc;
 
 	/* back to the userspace */
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocateDMABuffer)))
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocDMABuffer)))
 	{
 		struct file *filp = fcheck(fdesc);
 

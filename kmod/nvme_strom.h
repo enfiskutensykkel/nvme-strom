@@ -24,8 +24,7 @@ enum {
 	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT		= _IO('S',0x91),
 	STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC		= _IO('S',0x94),
 	STROM_IOCTL__MEMCPY_SSD2RAM_WAIT		= _IO('S',0x95),
-	STROM_IOCTL__ALLOCATE_DMA_BUFFER		= _IO('S',0x97),
-	STROM_IOCTL__RELEASE_DMA_BUFFER			= _IO('S',0x98),
+	STROM_IOCTL__ALLOC_DMA_BUFFER			= _IO('S',0x97),
 	STROM_IOCTL__STAT_INFO					= _IO('S',0x99),
 };
 
@@ -114,6 +113,9 @@ typedef struct StromCmd__MemCpySsdToGpuWait
 	long			status;		/* out: status of the DMA task */
 } StromCmd__MemCpySsdToGpuWait;
 
+/* STROM_IOCTL__MEMCPY_SSD2RAM_WAIT */
+typedef StromCmd__MemCpySsdToGpuWait StromCmd__MemCpySsdToRamWait;
+
 /* STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC */
 typedef struct StromCmd__MemCpySsdToRamAsync
 {
@@ -135,20 +137,13 @@ typedef struct StromCmd__MemCpySsdToRamAsync
 								 *     PostgreSQL). 0 means no boundary. */
 } StromCmd__MemCpySsdToRamAsync;
 
-/* STROM_IOCTL__MEMCPY_SSD2RAM_WAIT */
-typedef struct StromCmd__MemCpySsdToRamWait
-{
-	unsigned long	dma_task_id;/* in: ID of the DMA task to wait */
-	long			status;		/* out: status of the DMA task */
-} StromCmd__MemCpySsdToRamWait;
-
-/* STROM_IOCTL__ALLOCATE_DMA_BUFFER */
-typedef struct StromCmd__AllocateDMABuffer
+/* STROM_IOCTL__ALLOC_DMA_BUFFER */
+typedef struct StromCmd__AllocDMABuffer
 {
 	size_t			length;		/* in: required length of DMA buffer */
 	int				node_id;	/* in: numa-id to be located */
 	int				dmabuf_fdesc; /* out: FD of anon file descriptor */
-} StromCmd__AllocateDMABuffer;
+} StromCmd__AllocDMABuffer;
 
 /* STROM_IOCTL__STAT_INFO */
 typedef struct StromCmd__StatInfo
