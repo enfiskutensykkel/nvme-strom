@@ -29,7 +29,7 @@ CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
 	do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
 USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
 
-EXTRA_CLEAN := nvme_test nvme_stat
+EXTRA_CLEAN := nvme_test
 
 KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c pmemmap.c \
 	$(shell ls $(M)/*/md.h $(M)/*/raid0.h $(M)/*/nvme.h)
@@ -41,12 +41,10 @@ ccflags-y := -I. -I$(NVIDIA_SOURCE) 				\
 	-DKERNEL_VERSION_NUM=$(KERNEL_VERSION_NUM)		\
 	-DKERNEL_RELEASE_NUM=$(KERNEL_RELEASE_NUM)
 
-default: modules nvme_test nvme_stat
+default: modules nvme_test
 
 nvme_test: nvme_test.c nvme_strom.h
 	$(CC) -Wall nvme_test.c -o $@ $(USERSPACE_FLAGS) -lcuda -lpthread
-nvme_stat: nvme_stat.c nvme_strom.h
-	$(CC) -Wall nvme_stat.c -o $@ $(USERSPACE_FLAGS)
 
 # TODO:
 # Run 'dkms install $(NVME_STROM_PKGNAME)/$(NVME_STROM_VERSION)' here.

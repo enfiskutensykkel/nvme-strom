@@ -21,7 +21,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include "nvme_strom.h"
+#include "utils_common.h"
 
 static void
 print_mean(uint64_t N, uint64_t clocks, double clock_per_sec)
@@ -92,7 +92,6 @@ usage(const char *command_name)
 int
 main(int argc, char *argv[])
 {
-	int		fdesc;
 	int		loop;
 	int		interval;
 	int		c;
@@ -117,26 +116,15 @@ main(int argc, char *argv[])
 	else
 		usage(argv[0]);
 
-	fdesc = open(NVME_STROM_IOCTL_PATHNAME, O_RDONLY);
-	if (fdesc < 0)
-	{
-		fprintf(stderr, "failed to open \"%s\" : %m\n",
-				NVME_STROM_IOCTL_PATHNAME);
-		return 1;
-	}
-
 	if (interval > 0)
 	{
 		for (loop=-1; ; loop++)
 		{
 			memset(&curr_stat, 0, sizeof(StromCmd__StatInfo));
 			curr_stat.version = 1;
-			if (ioctl(fdesc, STROM_IOCTL__STAT_INFO, &curr_stat))
-			{
-				fprintf(stderr,
-						"failed on ioctl(STROM_IOCTL__STAT_INFO): %m\n");
-				return 1;
-			}
+			if (nvme_strom_ioctl(STROM_IOCTL__STAT_INFO, &curr_stat))
+				ELOG(errno, "failed on ioctl(STROM_IOCTL__STAT_INFO)");
+
 			gettimeofday(&tv2, NULL);
 			if (loop >= 0)
 				print_stat(loop, &prev_stat, &curr_stat, &tv1, &tv2);
@@ -149,11 +137,9 @@ main(int argc, char *argv[])
 	{
 		memset(&curr_stat, 0, sizeof(StromCmd__StatInfo));
 		curr_stat.version = 1;
-		if (ioctl(fdesc, STROM_IOCTL__STAT_INFO, &curr_stat))
-		{
-			fprintf(stderr, "failed on ioctl(STROM_IOCTL__STAT_INFO): %m\n");
-			return 1;
-		}
+		if (nvme_strom_ioctl(STROM_IOCTL__STAT_INFO, &curr_stat))
+			ELOG(errno, "failed on ioctl(STROM_IOCTL__STAT_INFO)");
+
 		printf("tsc:             %lu\n"
 			   "nr_ssd2gpu:      %lu\n"
 			   "clk_ssd2gpu:     %lu\n"
@@ -179,6 +165,5 @@ main(int argc, char *argv[])
 			   (unsigned long)curr_stat.cur_dma_count,
 			   (unsigned long)curr_stat.max_dma_count);
 	}
-	close(fdesc);
 	return 0;
 }
