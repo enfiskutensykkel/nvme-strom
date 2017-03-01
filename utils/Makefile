@@ -10,7 +10,7 @@ nvme_stat: ../kmod/nvme_strom.h nvme_stat.c
 	$(CC) -Wall nvme_stat.c -o $@ $(USERSPACE_FLAGS)
 
 ssd2ram_test: ../kmod/nvme_strom.h ssd2ram_test.c
-	$(CC) -Wall ssd2ram_test.c -o $@ $(USERSPACE_FLAGS)
+	$(CC) -Wall ssd2ram_test.c -o $@ $(USERSPACE_FLAGS) -lpthread
 
 clean:
 	rm -f $(UTILS)
