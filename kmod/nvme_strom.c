@@ -1009,7 +1009,7 @@ __callback_async_read_cmd(struct request *req, int error)
 /*
  * __submit_async_read_cmd - it submits READ command of NVMe-SSD, and then
  * returns immediately. Callback will put the supplied strom_dma_task,
- * thus, strom_memcpy_ssd2gpu_wait() allows synchronization of DMA completion.
+ * thus, strom_dma_task_wait() allows synchronization of DMA completion.
  */
 static int
 __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
@@ -1086,12 +1086,12 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 
 
 /*
- * strom_memcpy_ssd2gpu_wait - synchronization of a dma_task
+ * strom_memcpy_wait - synchronization of a dma_task
  */
 static int
-strom_memcpy_ssd2gpu_wait(unsigned long dma_task_id,
-						  long *p_dma_task_status,
-						  int task_state)
+strom_dma_task_wait(unsigned long dma_task_id,
+					long *p_dma_task_status,
+					int task_state)
 {
 	int					hindex = strom_dma_task_index(dma_task_id);
 	spinlock_t		   *lock = &strom_dma_task_locks[hindex];
@@ -1177,23 +1177,23 @@ out:
 }
 
 /*
- * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WAIT
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_WAIT
  */
 static int
-ioctl_memcpy_ssd2gpu_wait(StromCmd__MemCpySsdToGpuWait __user *uarg,
-						  struct file *ioctl_filp)
+ioctl_memcpy_wait(StromCmd__MemCpyWait __user *uarg,
+				  struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToGpuWait karg;
+	StromCmd__MemCpyWait karg;
 	long		retval;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpuWait)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpyWait)))
 		return -EFAULT;
 
 	karg.status = 0;
-	retval = strom_memcpy_ssd2gpu_wait(karg.dma_task_id,
-									   &karg.status,
-									   TASK_INTERRUPTIBLE);
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__MemCpySsdToGpuWait)))
+	retval = strom_dma_task_wait(karg.dma_task_id,
+								 &karg.status,
+								 TASK_INTERRUPTIBLE);
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__MemCpyWait)))
 		return -EFAULT;
 
 	return retval;
@@ -1447,13 +1447,13 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 }
 
 /*
- * main logic of STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK
+ * main logic of STROM_IOCTL__MEMCPY_SSD2GPU
  */
 static int
-memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
-						 strom_dma_task *dtask,
-						 uint32_t *chunk_ids_in,
-						 uint32_t *chunk_ids_out)
+do_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu *karg,
+				  strom_dma_task *dtask,
+				  uint32_t *chunk_ids_in,
+				  uint32_t *chunk_ids_out)
 {
 	mapped_gpu_memory  *mgmem = dtask->mgmem;
 	struct file		   *filp = dtask->filp;
@@ -1569,20 +1569,20 @@ memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack *karg,
 }
 
 /*
- * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK
+ * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU
  */
 static int
-ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
-							   struct file *ioctl_filp)
+ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg,
+					 struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToGpuWriteBack karg;
+	StromCmd__MemCpySsdToGpu karg;
 	mapped_gpu_memory  *mgmem;
 	strom_dma_task	   *dtask;
 	uint32_t		   *chunk_ids_in = NULL;
 	uint32_t		   *chunk_ids_out = NULL;
 	int					retval;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpuWriteBack)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpu)))
 		return -EFAULT;
 	chunk_ids_in = kmalloc(2 * sizeof(uint32_t) * karg.nr_chunks, GFP_KERNEL);
 	if (!chunk_ids_in)
@@ -1617,9 +1617,9 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	karg.nr_dma_submit = 0;
 	karg.nr_dma_blocks = 0;
 	
-	retval = memcpy_ssd2gpu_writeback(&karg, dtask,
-									  chunk_ids_in,
-									  chunk_ids_out);
+	retval = do_memcpy_ssd2gpu(&karg, dtask,
+							   chunk_ids_in,
+							   chunk_ids_out);
 	/* no more async jobs shall not acquire the @dtask any more */
 	dtask->frozen = true;
 	barrier();
@@ -1630,7 +1630,7 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	if (!retval)
 	{
 		if (copy_to_user(uarg, &karg,
-						 offsetof(StromCmd__MemCpySsdToGpuWriteBack, handle)))
+						 offsetof(StromCmd__MemCpySsdToGpu, handle)))
 			retval = -EFAULT;
 		else if (copy_to_user(karg.chunk_ids, chunk_ids_out,
 							  sizeof(uint32_t) * karg.nr_chunks))
@@ -1638,8 +1638,8 @@ ioctl_memcpy_ssd2gpu_writeback(StromCmd__MemCpySsdToGpuWriteBack __user *uarg,
 	}
 	/* synchronization of completion if any error */
 	if (retval)
-		strom_memcpy_ssd2gpu_wait(karg.dma_task_id, NULL,
-								  TASK_UNINTERRUPTIBLE);
+		strom_dma_task_wait(karg.dma_task_id, NULL,
+							TASK_UNINTERRUPTIBLE);
 out:
 	kfree(chunk_ids_in);
 	return retval;
@@ -1726,12 +1726,12 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
 }
 
 /*
- * memcpy_ssd2ram_async - submit DMA requests
+ * do_memcpy_ssd2ram - main part of SSD-to-RAM DMA
  */
 static int
-memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync *karg,
-					 strom_dma_task *dtask,
-					 size_t dest_offset, uint32_t *chunk_ids)
+do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
+				  strom_dma_task *dtask,
+				  size_t dest_offset, uint32_t *chunk_ids)
 {
 	strom_dma_buffer   *sd_buf = dtask->sd_buf;
 	struct file		   *filp = dtask->filp;
@@ -1840,13 +1840,13 @@ memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync *karg,
 }
 
 /*
- * ioctl_memcpy_ssd2ram_async - handler for STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC
+ * ioctl_memcpy_ssd2ram - handler for STROM_IOCTL__MEMCPY_SSD2RAM
  */
 static int
-ioctl_memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync __user *uarg,
-						   struct file *ioctl_filp)
+ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
+					 struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToRamAsync karg;
+	StromCmd__MemCpySsdToRam karg;
 	struct vm_area_struct  *vma = NULL;
 	struct mm_struct	   *mm = current->mm;
 	strom_dma_buffer	   *sd_buf;
@@ -1908,7 +1908,7 @@ ioctl_memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync __user *uarg,
 	karg.nr_ram2ram = 0;
 	karg.nr_ssd2ram = 0;
 
-	retval = memcpy_ssd2ram_async(&karg, dtask, dest_offset, chunk_ids);
+	retval = do_memcpy_ssd2ram(&karg, dtask, dest_offset, chunk_ids);
 	/* no more async task shall acquire the @dtask any more */
 	dtask->frozen = true;
 	barrier();
@@ -1919,13 +1919,13 @@ ioctl_memcpy_ssd2ram_async(StromCmd__MemCpySsdToRamAsync __user *uarg,
 	if (!retval)
 	{
 		if (copy_to_user(uarg, &karg,
-						 offsetof(StromCmd__MemCpySsdToRamAsync, dest_uaddr)))
+						 offsetof(StromCmd__MemCpySsdToRam, dest_uaddr)))
 			retval = -EFAULT;
 	}
 	/* synchronization of completion if any error */
 	if (retval)
-		strom_memcpy_ssd2gpu_wait(karg.dma_task_id, NULL,
-								  TASK_UNINTERRUPTIBLE);
+		strom_dma_task_wait(karg.dma_task_id, NULL,
+							TASK_UNINTERRUPTIBLE);
 out:
 	kfree(chunk_ids);
 	return retval;
@@ -2057,24 +2057,20 @@ strom_proc_ioctl(struct file *ioctl_filp,
 			retval = ioctl_info_gpu_memory((void __user *) arg);
 			break;
 
-		case STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK:
-			retval = ioctl_memcpy_ssd2gpu_writeback((void __user *) arg,
-													ioctl_filp);
-			break;
-
-		case STROM_IOCTL__MEMCPY_SSD2GPU_WAIT:
-		case STROM_IOCTL__MEMCPY_SSD2RAM_WAIT:	/* same logic */
-			retval = ioctl_memcpy_ssd2gpu_wait((void __user *) arg,
-											   ioctl_filp);
-			break;
-
-		case STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC:
-			retval = ioctl_memcpy_ssd2ram_async((void __user *) arg,
-												ioctl_filp);
-			break;
-
 		case STROM_IOCTL__ALLOC_DMA_BUFFER:
 			retval = ioctl_alloc_dma_buffer((void __user *) arg);
+			break;
+
+		case STROM_IOCTL__MEMCPY_SSD2GPU:
+			retval = ioctl_memcpy_ssd2gpu((void __user *) arg, ioctl_filp);
+			break;
+
+		case STROM_IOCTL__MEMCPY_SSD2RAM:
+			retval = ioctl_memcpy_ssd2ram((void __user *) arg, ioctl_filp);
+			break;
+
+		case STROM_IOCTL__MEMCPY_WAIT:
+			retval = ioctl_memcpy_wait((void __user *) arg, ioctl_filp);
 			break;
 
 		case STROM_IOCTL__STAT_INFO:

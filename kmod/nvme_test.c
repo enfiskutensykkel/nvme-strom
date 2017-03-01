@@ -201,21 +201,21 @@ typedef struct
 	CUstream		cuda_stream;
 	void		   *src_buffer;
 	void		   *dest_buffer;
-	StromCmd__MemCpySsdToGpuWriteBack uarg;
+	StromCmd__MemCpySsdToGpu uarg;
 } async_task;
 
 static void
 callback_dma_wait(CUstream cuda_stream, CUresult status, void *private)
 {
-	StromCmd__MemCpySsdToGpuWait	uarg;
+	StromCmd__MemCpyWait uarg;
 	async_task	   *atask = private;
 	int				rv;
 
 	cuda_exit_on_error(status, "async_task");
 
-	memset(&uarg, 0, sizeof(StromCmd__MemCpySsdToGpuWait));
+	memset(&uarg, 0, sizeof(StromCmd__MemCpyWait));
 	uarg.dma_task_id = atask->uarg.dma_task_id;
-	rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WAIT, &uarg);
+	rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &uarg);
 	if (uarg.status)
 		printf("async dma (id=%lu, status=%ld)\n",
 			   uarg.dma_task_id, uarg.status);
@@ -290,7 +290,7 @@ setup_async_tasks(int fdesc, unsigned long handle)
 
 	for (i=0; i < nr_segments; i++)
 	{
-		StromCmd__MemCpySsdToGpuWriteBack  *uarg;
+		StromCmd__MemCpySsdToGpu  *uarg;
 
 		uarg = &async_tasks[i].uarg;
 
@@ -432,9 +432,9 @@ exec_test_by_strom(CUdeviceptr cuda_devptr, unsigned long handle,
 		for (i=0; i < atask->uarg.nr_chunks; i++)
 			atask->uarg.chunk_ids[i] = fpos / BLCKSZ + i;
 
-		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK,
+		rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2GPU,
 							  &atask->uarg);
-		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK");
+		system_exit_on_error(rv, "STROM_IOCTL__MEMCPY_SSD2GPU");
 
 		nr_ram2gpu += atask->uarg.nr_ram2gpu;
 		nr_ssd2gpu += atask->uarg.nr_ssd2gpu;

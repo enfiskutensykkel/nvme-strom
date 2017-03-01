@@ -15,17 +15,16 @@
 #include <asm/ioctl.h>
 
 enum {
-	STROM_IOCTL__CHECK_FILE					= _IO('S',0x80),
-	STROM_IOCTL__MAP_GPU_MEMORY				= _IO('S',0x81),
-	STROM_IOCTL__UNMAP_GPU_MEMORY			= _IO('S',0x82),
-	STROM_IOCTL__LIST_GPU_MEMORY			= _IO('S',0x83),
-	STROM_IOCTL__INFO_GPU_MEMORY			= _IO('S',0x84),
-	STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK	= _IO('S',0x90),
-	STROM_IOCTL__MEMCPY_SSD2GPU_WAIT		= _IO('S',0x91),
-	STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC		= _IO('S',0x94),
-	STROM_IOCTL__MEMCPY_SSD2RAM_WAIT		= _IO('S',0x95),
-	STROM_IOCTL__ALLOC_DMA_BUFFER			= _IO('S',0x97),
-	STROM_IOCTL__STAT_INFO					= _IO('S',0x99),
+	STROM_IOCTL__CHECK_FILE			= _IO('S',0x80),
+	STROM_IOCTL__MAP_GPU_MEMORY		= _IO('S',0x81),
+	STROM_IOCTL__UNMAP_GPU_MEMORY	= _IO('S',0x82),
+	STROM_IOCTL__LIST_GPU_MEMORY	= _IO('S',0x83),
+	STROM_IOCTL__INFO_GPU_MEMORY	= _IO('S',0x84),
+	STROM_IOCTL__ALLOC_DMA_BUFFER	= _IO('S',0x85),
+	STROM_IOCTL__MEMCPY_SSD2GPU		= _IO('S',0x90),
+	STROM_IOCTL__MEMCPY_SSD2RAM		= _IO('S',0x91),
+	STROM_IOCTL__MEMCPY_WAIT		= _IO('S',0x92),
+	STROM_IOCTL__STAT_INFO			= _IO('S',0x99),
 };
 
 /* path of ioctl(2) entrypoint */
@@ -35,16 +34,12 @@ enum {
 typedef struct StromCmd__CheckFile
 {
 	int				fdesc;		/* in: file descriptor to be checked */
-	int				numa_node_id;/* out: NUMA node-id where the storage
-								  *      device is installed. It can be -1,
-								  *      if md-raid0 stripes SSDs on multiple
-								  *      NUMA nodes.
-								  */
-	int				support_dma64;/* out: non-zero, if source SSD device
-								   *      supports 64bit DMA; which means
-								   *      Numa aware SSD2RAM DMA is also
-								   *      supported.
-								   */
+	/* out: NUMA node-id where the storage device is installed. It can
+	 *      be -1, if md-raid0 stripes SSDs on multiple NUMA nodes. */
+	int				numa_node_id;
+	/* out: non-zero, if source SSD device supports 64bit DMA; which
+	 *      means NUMA aware SSD2RAM DMA is also supported. */
+	int				support_dma64;
 } StromCmd__CheckFile;
 
 /* STROM_IOCTL__MAP_GPU_MEMORY */
@@ -85,8 +80,8 @@ typedef struct StromCmd__InfoGpuMemory
 	uint64_t		paddrs[1];	/* out: array of physical addresses */
 } StromCmd__InfoGpuMemory;
 
-/* STROM_IOCTL__MEMCPY_SSD2GPU_WRITEBACK */
-typedef struct StromCmd__MemCpySsdToGpuWriteBack
+/* STROM_IOCTL__MEMCPY_SSD2GPU */
+typedef struct StromCmd__MemCpySsdToGpu
 {
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2gpu;	/* out: # of RAM2GPU chunks */
@@ -104,20 +99,17 @@ typedef struct StromCmd__MemCpySsdToGpuWriteBack
 	char __user	   *wb_buffer;	/* in: write-back buffer in user space;
 								 * consumed from the tail, and must be at least
 								 * chunk_sz * nr_chunks bytes. */
-} StromCmd__MemCpySsdToGpuWriteBack;
+} StromCmd__MemCpySsdToGpu;
 
-/* STROM_IOCTL__MEMCPY_SSD2GPU_WAIT */
-typedef struct StromCmd__MemCpySsdToGpuWait
+/* STROM_IOCTL__MEMCPY_WAIT */
+typedef struct StromCmd__MemCpyWait
 {
 	unsigned long	dma_task_id;/* in: ID of the DMA task to wait */
 	long			status;		/* out: status of the DMA task */
-} StromCmd__MemCpySsdToGpuWait;
+} StromCmd__MemCpyWait;
 
-/* STROM_IOCTL__MEMCPY_SSD2RAM_WAIT */
-typedef StromCmd__MemCpySsdToGpuWait StromCmd__MemCpySsdToRamWait;
-
-/* STROM_IOCTL__MEMCPY_SSD2RAM_ASYNC */
-typedef struct StromCmd__MemCpySsdToRamAsync
+/* STROM_IOCTL__MEMCPY_SSD2RAM */
+typedef struct StromCmd__MemCpySsdToRam
 {
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
@@ -135,7 +127,7 @@ typedef struct StromCmd__MemCpySsdToRamAsync
 								 *     in PostgreSQL). 0 means no boundary. */
 	uint32_t __user *chunk_ids;	/* in: # of chunks per file (RELSEG_SIZE in
 								 *     PostgreSQL). 0 means no boundary. */
-} StromCmd__MemCpySsdToRamAsync;
+} StromCmd__MemCpySsdToRam;
 
 /* STROM_IOCTL__ALLOC_DMA_BUFFER */
 typedef struct StromCmd__AllocDMABuffer
