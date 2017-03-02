@@ -1763,6 +1763,7 @@ do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
 	}
 
 	dest_segment_sz = ((size_t)sd_buf->segment_sz *
+					   (size_t)PAGE_SIZE *
 					   (size_t)sd_buf->nr_segments);
 	i_size = i_size_read(f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
@@ -2172,4 +2173,4 @@ module_exit(nvme_strom_exit);
 MODULE_AUTHOR("KaiGai Kohei <kaigai@kaigai.gr.jp>");
 MODULE_DESCRIPTION("SSD-to-GPU Direct Stream Module");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.5");
+MODULE_VERSION("0.6");
