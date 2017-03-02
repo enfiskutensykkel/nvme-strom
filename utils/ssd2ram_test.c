@@ -127,7 +127,7 @@ alloc_dma_buffer(int node_id)
 				  cmd.dmabuf_fdesc, 0);
 	if (buffer == MAP_FAILED)
 		ELOG(errno, "failed on mmap(2) with DMA buffer FD");
-
+	printf("mmap(2) = %p\n", buffer);
 	return buffer;
 }
 
@@ -174,7 +174,7 @@ ssd2ram_worker(void *__args__)
 
 			gettimeofday(&tv1, NULL);
 			memset(&__cmd, 0, sizeof(__cmd));
-			__cmd.dma_task_id	= dma_tasks[windex++];
+			__cmd.dma_task_id	= dma_tasks[windex++ % n_units];
 			if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &__cmd))
 				ELOG(errno, "failed on ioctl(STROM_IOCTL__MEMCPY_WAIT)");
 			gettimeofday(&tv2, NULL);
@@ -188,7 +188,7 @@ ssd2ram_worker(void *__args__)
 
 		/* setup MEMCPY_SSD2RAM command */
 		memset(&cmd, 0, sizeof(cmd));
-		cmd.dest_uaddr	= dma_buffer + rindex * unitsz;
+		cmd.dest_uaddr	= dma_buffer + i * unitsz;
 		cmd.file_desc	= source_fdesc;
 		if (fpos + unitsz <= source_fstat.st_size)
 			cmd.nr_chunks = (unitsz / BLCKSZ);
@@ -199,7 +199,7 @@ ssd2ram_worker(void *__args__)
 		cmd.chunk_ids	= chunk_ids;
 
 		for (i=0; i < cmd.nr_chunks; i++)
-			cmd.chunk_ids[i] = fpos + i * BLCKSZ;
+			cmd.chunk_ids[i] = fpos / BLCKSZ + i;
 
 		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2RAM, &cmd))
 			ELOG(errno, "failed on ioctl(STROM_IOCTL__MEMCPY_SSD2RAM)");
@@ -264,6 +264,7 @@ print_results(long time_ms)
 		printf(", avg DMA blocks: %.2f",
 			   (double)total_nr_dma_blocks /
 			   (double)total_nr_dma_submit);
+	putchar('\n');
 }
 
 static void

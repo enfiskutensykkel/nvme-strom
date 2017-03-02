@@ -1753,7 +1753,14 @@ do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
 		return -EINVAL;
 	if (dest_offset + ((size_t)karg->chunk_sz *
 					   (size_t)karg->nr_chunks) > sd_buf->length)
+	{
+		prError("dest_offset=%lu-%lu buflen=%zu",
+				dest_offset,
+				dest_offset + ((size_t)karg->chunk_sz *
+							   (size_t)karg->nr_chunks),
+				sd_buf->length);
 		return -ERANGE;
+	}
 
 	dest_segment_sz = ((size_t)sd_buf->segment_sz *
 					   (size_t)sd_buf->nr_segments);
@@ -1771,7 +1778,10 @@ do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
 			fpos = (chunk_id % karg->relseg_sz) * (size_t)karg->chunk_sz;
 		Assert((fpos & (PAGE_CACHE_SIZE - 1)) == 0);
 		if (fpos > i_size)
+		{
+			prError("fpos=%ld i_size=%zu", (long)fpos, i_size);
 			return -ERANGE;
+		}
 
 		for (j=0, k=(fpos >> PAGE_CACHE_SHIFT); j < nr_pages; j++, k++)
 		{
@@ -1881,13 +1891,8 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 	{
 		up_read(&mm->mmap_sem);
 		retval = -EINVAL;
-		prError("hoge vma=%p vm_file=%p f_op=%p %p", vma,
-				!vma ? NULL : vma->vm_file,
-				!vma || !vma->vm_file ? NULL : vma->vm_file->f_op,
-				&strom_dma_buffer_fops);
 		goto out;
 	}
-	prError("moke");
 
 	if (dest_uaddr < vma->vm_start ||
 		dest_uaddr + ((size_t)karg.nr_chunks *
@@ -1895,6 +1900,11 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 	{
 		up_read(&mm->mmap_sem);
 		retval = -ERANGE;
+		prError("uaddr(%p-%p) vm(%p-%p)",
+				(void *)(dest_uaddr),
+				(void *)(dest_uaddr + (size_t)karg.nr_chunks * (size_t)karg.chunk_sz),
+				(void *)vma->vm_start,
+				(void *)vma->vm_end);
 		goto out;
 	}
 	dest_offset = vma->vm_pgoff * PAGE_SIZE + (dest_uaddr - vma->vm_start);
@@ -1909,7 +1919,6 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 		retval = PTR_ERR(dtask);
 		goto out;
 	}
-	prError("monu 2");
 	karg.dma_task_id = dtask->dma_task_id;
 	karg.nr_ram2ram = 0;
 	karg.nr_ssd2ram = 0;
