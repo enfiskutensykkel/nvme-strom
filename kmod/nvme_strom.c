@@ -1881,8 +1881,13 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 	{
 		up_read(&mm->mmap_sem);
 		retval = -EINVAL;
+		prError("hoge vma=%p vm_file=%p f_op=%p %p", vma,
+				!vma ? NULL : vma->vm_file,
+				!vma || !vma->vm_file ? NULL : vma->vm_file->f_op,
+				&strom_dma_buffer_fops);
 		goto out;
 	}
+	prError("moke");
 
 	if (dest_uaddr < vma->vm_start ||
 		dest_uaddr + ((size_t)karg.nr_chunks *
@@ -1904,6 +1909,7 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 		retval = PTR_ERR(dtask);
 		goto out;
 	}
+	prError("monu 2");
 	karg.dma_task_id = dtask->dma_task_id;
 	karg.nr_ram2ram = 0;
 	karg.nr_ssd2ram = 0;
