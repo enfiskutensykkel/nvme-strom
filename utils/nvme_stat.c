@@ -30,42 +30,44 @@ print_mean(uint64_t N, uint64_t clocks, double clock_per_sec)
 
 	if (N == 0)
 	{
-		printf("----");
+		printf("       ----");
 		return;
 	}
 
 	value = (double)(clocks / N) / clock_per_sec;
 	if (value > 2.0)			/* 2.0s */
-		printf("%.2fs", value);
+		printf(" % 9.2fs", value);
 	else if (value > 0.005)		/* 5ms */
-		printf("%.2fms", value * 1000.0);
+		printf(" % 8.2fms", value * 1000.0);
 	else if (value > 0.000005)	/* 5us */
-		printf("%.2fus", value * 1000000.0);
+		printf(" % 8.2fus", value * 1000000.0);
 	else
-		printf("%.0fns", value * 1000000000.0);
+		printf(" % 8.0fns", value * 1000000000.0);
 }
 
 static void
 print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 		   struct timeval *tv1, struct timeval *tv2)
 {
-  	uint64_t	nr_ssd2gpu = c->nr_ssd2gpu - p->nr_ssd2gpu;
-	uint64_t	clk_ssd2gpu = c->clk_ssd2gpu - p->clk_ssd2gpu;
-	uint64_t	nr_setup_prps = c->nr_setup_prps - p->nr_setup_prps;
-	uint64_t	clk_setup_prps = c->clk_setup_prps - p->clk_setup_prps;
-	uint64_t	nr_submit_dma = c->nr_submit_dma - p->nr_submit_dma;
-	uint64_t	clk_submit_dma = c->clk_submit_dma - p->clk_submit_dma;
-	uint64_t	nr_wait_dtask = c->nr_wait_dtask - p->nr_wait_dtask;
-	uint64_t	clk_wait_dtask = c->clk_wait_dtask - p->clk_wait_dtask;
-	uint64_t	nr_wrong_wakeup = c->nr_wrong_wakeup - p->nr_wrong_wakeup;
-	uint64_t	nr_debug1 = c->nr_debug1 - p->nr_debug1;
-	uint64_t	nr_debug2 = c->nr_debug2 - p->nr_debug2;
-	uint64_t	nr_debug3 = c->nr_debug3 - p->nr_debug3;
-	uint64_t	nr_debug4 = c->nr_debug4 - p->nr_debug4;
-	uint64_t	clk_debug1 = c->clk_debug1 - p->clk_debug1;
-	uint64_t	clk_debug2 = c->clk_debug2 - p->clk_debug2;
-	uint64_t	clk_debug3 = c->clk_debug3 - p->clk_debug3;
-	uint64_t	clk_debug4 = c->clk_debug4 - p->clk_debug4;
+#define DECL_DIFF(C,P,FIELD)	uint64_t FIELD = (C)->FIELD - (P)->FIELD;
+	DECL_DIFF(c,p,nr_ssd2gpu);
+	DECL_DIFF(c,p,clk_ssd2gpu);
+	DECL_DIFF(c,p,nr_setup_prps);
+	DECL_DIFF(c,p,clk_setup_prps);
+	DECL_DIFF(c,p,nr_submit_dma);
+	DECL_DIFF(c,p,clk_submit_dma);
+	DECL_DIFF(c,p,nr_wait_dtask);
+	DECL_DIFF(c,p,clk_wait_dtask);
+	DECL_DIFF(c,p,nr_wrong_wakeup);
+	DECL_DIFF(c,p,nr_debug1);
+	DECL_DIFF(c,p,nr_debug2);
+	DECL_DIFF(c,p,nr_debug3);
+	DECL_DIFF(c,p,nr_debug4);
+	DECL_DIFF(c,p,clk_debug1);
+	DECL_DIFF(c,p,clk_debug2);
+	DECL_DIFF(c,p,clk_debug3);
+	DECL_DIFF(c,p,clk_debug4);
+#undef DECL_DIFF
 	double		interval;
 	double		clocks_per_sec;
 
@@ -75,31 +77,25 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 
 	if (loop % 25 == 0)
 	{
-		printf("avg-dma  avg-prps  avg-submit  avg-wait  bad-wakeup  DMA(cur)  DMA(max)");
+		printf("    avg-dma   avg-prps avg-submit   avg-wait"
+			   " bad-wakeup   DMA(cur)   DMA(max)");
 		if (c->has_debug)
-			printf("  debug1  debug2  debug3  debug4");
+			printf("     debug1     debug2     debug3     debug4");
 		putchar('\n');
 	}
 	print_mean(nr_ssd2gpu, clk_ssd2gpu, clocks_per_sec);
-	putchar('\t');
 	print_mean(nr_setup_prps, clk_setup_prps, clocks_per_sec);
-	putchar('\t');
 	print_mean(nr_submit_dma, clk_submit_dma, clocks_per_sec);
-	putchar('\t');
 	print_mean(nr_wait_dtask, clk_wait_dtask, clocks_per_sec);
-	printf("\t%lu\t%lu\t%lu",
+	printf(" %10lu %10lu %10lu",
 		   nr_wrong_wakeup,
 		   c->cur_dma_count,
 		   c->max_dma_count);
 	if (c->has_debug)
 	{
-		putchar('\t');
 		print_mean(nr_debug1, clk_debug1, clocks_per_sec);
-		putchar('\t');
 		print_mean(nr_debug2, clk_debug2, clocks_per_sec);
-		putchar('\t');
 		print_mean(nr_debug3, clk_debug3, clocks_per_sec);
-		putchar('\t');
 		print_mean(nr_debug4, clk_debug4, clocks_per_sec);
 	}
 	putchar('\n');
