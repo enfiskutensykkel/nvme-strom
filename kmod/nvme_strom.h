@@ -140,7 +140,8 @@ typedef struct StromCmd__AllocDMABuffer
 /* STROM_IOCTL__STAT_INFO */
 typedef struct StromCmd__StatInfo
 {
-	unsigned int	version;	/* = 1, always */
+	unsigned int	version;	/* in: = 1, always */
+	unsigned char	has_debug;	/* out: true, if debug fields are valid */
 	uint64_t		tsc;		/* tsc counter */
 	uint64_t		nr_ssd2gpu;
 	uint64_t		clk_ssd2gpu;
@@ -153,6 +154,14 @@ typedef struct StromCmd__StatInfo
 	uint64_t		nr_wrong_wakeup;
 	uint64_t		cur_dma_count;
 	uint64_t		max_dma_count;
+	uint64_t		nr_debug1;
+	uint64_t		clk_debug1;
+	uint64_t		nr_debug2;
+	uint64_t		clk_debug2;
+	uint64_t		nr_debug3;
+	uint64_t		clk_debug3;
+	uint64_t		nr_debug4;
+	uint64_t		clk_debug4;
 } StromCmd__StatInfo;
 
 #endif /* NVME_STROM_H */

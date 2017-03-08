@@ -58,6 +58,14 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 	uint64_t	nr_wait_dtask = c->nr_wait_dtask - p->nr_wait_dtask;
 	uint64_t	clk_wait_dtask = c->clk_wait_dtask - p->clk_wait_dtask;
 	uint64_t	nr_wrong_wakeup = c->nr_wrong_wakeup - p->nr_wrong_wakeup;
+	uint64_t	nr_debug1 = c->nr_debug1 - p->nr_debug1;
+	uint64_t	nr_debug2 = c->nr_debug2 - p->nr_debug2;
+	uint64_t	nr_debug3 = c->nr_debug3 - p->nr_debug3;
+	uint64_t	nr_debug4 = c->nr_debug4 - p->nr_debug4;
+	uint64_t	clk_debug1 = c->clk_debug1 - p->clk_debug1;
+	uint64_t	clk_debug2 = c->clk_debug2 - p->clk_debug2;
+	uint64_t	clk_debug3 = c->clk_debug3 - p->clk_debug3;
+	uint64_t	clk_debug4 = c->clk_debug4 - p->clk_debug4;
 	double		interval;
 	double		clocks_per_sec;
 
@@ -66,7 +74,12 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 	clocks_per_sec = (double)(c->tsc - p->tsc) / interval;
 
 	if (loop % 25 == 0)
-		printf("avg-dma  avg-prps  avg-submit  avg-wait  bad-wakeup  DMA(cur)  DMA(max)\n");
+	{
+		printf("avg-dma  avg-prps  avg-submit  avg-wait  bad-wakeup  DMA(cur)  DMA(max)");
+		if (c->has_debug)
+			printf("  debug1  debug2  debug3  debug4");
+		putchar('\n');
+	}
 	print_mean(nr_ssd2gpu, clk_ssd2gpu, clocks_per_sec);
 	putchar('\t');
 	print_mean(nr_setup_prps, clk_setup_prps, clocks_per_sec);
@@ -74,10 +87,22 @@ print_stat(int loop, StromCmd__StatInfo *p, StromCmd__StatInfo *c,
 	print_mean(nr_submit_dma, clk_submit_dma, clocks_per_sec);
 	putchar('\t');
 	print_mean(nr_wait_dtask, clk_wait_dtask, clocks_per_sec);
-	printf("\t%lu\t%lu\t%lu\n",
+	printf("\t%lu\t%lu\t%lu",
 		   nr_wrong_wakeup,
 		   c->cur_dma_count,
 		   c->max_dma_count);
+	if (c->has_debug)
+	{
+		putchar('\t');
+		print_mean(nr_debug1, clk_debug1, clocks_per_sec);
+		putchar('\t');
+		print_mean(nr_debug2, clk_debug2, clocks_per_sec);
+		putchar('\t');
+		print_mean(nr_debug3, clk_debug3, clocks_per_sec);
+		putchar('\t');
+		print_mean(nr_debug4, clk_debug4, clocks_per_sec);
+	}
+	putchar('\n');
 }
 
 static void
@@ -164,6 +189,23 @@ main(int argc, char *argv[])
 			   (unsigned long)curr_stat.nr_wrong_wakeup,
 			   (unsigned long)curr_stat.cur_dma_count,
 			   (unsigned long)curr_stat.max_dma_count);
+		if (curr_stat.has_debug)
+			printf("nr_debug1:       %lu\n"
+				   "clk_debug1:      %lu\n"
+				   "nr_debug2:       %lu\n"
+				   "clk_debug2:      %lu\n"
+				   "nr_debug3:       %lu\n"
+				   "clk_debug3:      %lu\n"
+				   "nr_debug4:       %lu\n"
+				   "clk_debug4:      %lu\n",
+				   (unsigned long)curr_stat.nr_debug1,
+				   (unsigned long)curr_stat.clk_debug1,
+				   (unsigned long)curr_stat.nr_debug2,
+				   (unsigned long)curr_stat.clk_debug2,
+				   (unsigned long)curr_stat.nr_debug3,
+				   (unsigned long)curr_stat.clk_debug3,
+				   (unsigned long)curr_stat.nr_debug4,
+				   (unsigned long)curr_stat.clk_debug4);
 	}
 	return 0;
 }

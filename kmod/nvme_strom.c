@@ -109,7 +109,8 @@ atomic64_max_return(long newval, atomic64_t *atomic_ptr)
 	printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__)
 
 /* routines for extra symbols */
-#define EXTRA_KSYMS_NEEDS_NVIDIA	1
+#define EXTRA_KSYMS_NEEDS_NVIDIA		1
+//#define EXTRA_KSYMS_NEEDS_DEBUG_STATS	1
 #include "extra_ksyms.c"
 
 /*
@@ -1974,7 +1975,19 @@ ioctl_stat_info_command(StromCmd__StatInfo __user *uarg)
 	karg.nr_wrong_wakeup = atomic64_read(&stat_nr_wrong_wakeup);
 	karg.cur_dma_count	= atomic64_read(&stat_cur_dma_count);
 	karg.max_dma_count	= atomic64_xchg(&stat_max_dma_count, 0UL);
-
+#ifdef EXTRA_KSYMS_NEEDS_DEBUG_STATS
+	karg.has_debug		= 1;
+	karg.nr_debug1		= atomic64_read(p_stat_nr_debug1);
+	karg.clk_debug1		= atomic64_read(p_stat_clk_debug1);
+	karg.nr_debug2		= atomic64_read(p_stat_nr_debug2);
+	karg.clk_debug2		= atomic64_read(p_stat_clk_debug2);
+	karg.nr_debug3		= atomic64_read(p_stat_nr_debug3);
+	karg.clk_debug3		= atomic64_read(p_stat_clk_debug3);
+	karg.nr_debug4		= atomic64_read(p_stat_nr_debug4);
+	karg.clk_debug4		= atomic64_read(p_stat_clk_debug4);
+#else
+	karg.has_debug		= 0;
+#endif
 	if (copy_to_user(uarg, &karg, sizeof(StromCmd__StatInfo)))
 		return -EFAULT;
 

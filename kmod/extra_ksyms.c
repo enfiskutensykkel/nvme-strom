@@ -90,6 +90,28 @@ __nvme_alloc_request(struct request_queue *q,
 	return p_nvme_alloc_request(q, cmd, flags);
 }
 
+#ifdef EXTRA_KSYMS_NEEDS_DEBUG_STATS
+/*
+ * statistics variables for debug
+ */
+static struct module *mod_stat_nr_debug1 = NULL;
+static struct module *mod_stat_nr_debug2 = NULL;
+static struct module *mod_stat_nr_debug3 = NULL;
+static struct module *mod_stat_nr_debug4 = NULL;
+static struct module *mod_stat_clk_debug1 = NULL;
+static struct module *mod_stat_clk_debug2 = NULL;
+static struct module *mod_stat_clk_debug3 = NULL;
+static struct module *mod_stat_clk_debug4 = NULL;
+static atomic64_t *p_stat_nr_debug1 = NULL;
+static atomic64_t *p_stat_nr_debug2 = NULL;
+static atomic64_t *p_stat_nr_debug3 = NULL;
+static atomic64_t *p_stat_nr_debug4 = NULL;
+static atomic64_t *p_stat_clk_debug1 = NULL;
+static atomic64_t *p_stat_clk_debug2 = NULL;
+static atomic64_t *p_stat_clk_debug3 = NULL;
+static atomic64_t *p_stat_clk_debug4 = NULL;
+#endif
+
 /* ext4_get_block */
 static struct module *mod_ext4_get_block = NULL;
 static int (* p_ext4_get_block)(
@@ -201,6 +223,16 @@ strom_put_all_extra_modules(void)
 #endif
 	/* nvme */
 	module_put(mod_nvme_alloc_request);
+#ifdef EXTRA_KSYMS_NEEDS_DEBUG_STATS
+	module_put(mod_stat_nr_debug1);
+	module_put(mod_stat_nr_debug2);
+	module_put(mod_stat_nr_debug3);
+	module_put(mod_stat_nr_debug4);
+	module_put(mod_stat_clk_debug1);
+	module_put(mod_stat_clk_debug2);
+	module_put(mod_stat_clk_debug3);
+	module_put(mod_stat_clk_debug4);
+#endif
 	/* file systems */
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
@@ -243,6 +275,16 @@ strom_init_extra_symbols(void)
 #endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
 	/* nvme.ko */
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_alloc_request);
+#ifdef EXTRA_KSYMS_NEEDS_DEBUG_STATS
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_nr_debug1);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_nr_debug2);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_nr_debug3);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_nr_debug4);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_clk_debug1);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_clk_debug2);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_clk_debug3);
+	LOOKUP_MANDATORY_EXTRA_SYMBOL(stat_clk_debug4);
+#endif
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
 	if (rc)
