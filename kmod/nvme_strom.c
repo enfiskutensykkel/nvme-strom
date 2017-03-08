@@ -62,7 +62,7 @@ static int	verbose = 0;
 module_param(verbose, int, 0644);
 MODULE_PARM_DESC(verbose, "turn on/off debug message");
 /* run-time statistics */
-static int	stat_info = 1;
+static int	stat_info = 2;
 module_param(stat_info, int, 0644);
 MODULE_PARM_DESC(stat_info, "turn on/off run-time statistics");
 static atomic64_t	stat_nr_ssd2gpu = ATOMIC64_INIT(0);
@@ -76,6 +76,14 @@ static atomic64_t	stat_clk_wait_dtask = ATOMIC64_INIT(0);
 static atomic64_t	stat_nr_wrong_wakeup = ATOMIC64_INIT(0);
 static atomic64_t	stat_cur_dma_count = ATOMIC64_INIT(0);
 static atomic64_t	stat_max_dma_count = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_debug1 = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_debug2 = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_debug3 = ATOMIC64_INIT(0);
+static atomic64_t	stat_nr_debug4 = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_debug1 = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_debug2 = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_debug3 = ATOMIC64_INIT(0);
+static atomic64_t	stat_clk_debug4 = ATOMIC64_INIT(0);
 
 static inline long
 atomic64_max_return(long newval, atomic64_t *atomic_ptr)
@@ -110,7 +118,6 @@ atomic64_max_return(long newval, atomic64_t *atomic_ptr)
 
 /* routines for extra symbols */
 #define EXTRA_KSYMS_NEEDS_NVIDIA		1
-//#define EXTRA_KSYMS_NEEDS_DEBUG_STATS	1
 #include "extra_ksyms.c"
 
 /*
@@ -1025,8 +1032,11 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	u32						dsmgmt = 0;
 	u32						nblocks;
 	u64						slba;
+	u64						tv1, tv2, tv3, tv4;
 	dma_addr_t				prp1, prp2;
 	int						npages;
+
+	tv1 = rdtsc();
 
 	/* setup scatter-gather list */
 	length = (dtask->nr_sectors << SECTOR_SHIFT);
@@ -1049,6 +1059,9 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	async_cmd_cxt = kzalloc(sizeof(strom_async_cmd_context), GFP_KERNEL);
 	if (!async_cmd_cxt)
 		return -ENOMEM;
+
+	tv2 = rdtsc();
+
 	/* setup READ command */
 	cmd = &async_cmd_cxt->cmd.rw;
 	cmd->opcode		= nvme_cmd_read;
@@ -1079,9 +1092,20 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	async_cmd_cxt->tv1		= rdtsc();
 	req->end_io_data		= async_cmd_cxt;
 
+	tv3 = rdtsc();
+
 	/* throw asynchronous i/o request */
 	blk_execute_rq_nowait(nvme_ns->queue, nvme_ns->disk, req, 0,
 						  __callback_async_read_cmd);
+
+	tv4 = rdtsc();
+	atomic64_add((u64)(tv2 - tv1 ? tv2 - tv1 : 0), &stat_clk_debug1);
+	atomic64_inc(&stat_nr_debug1);
+	atomic64_add((u64)(tv3 - tv2 ? tv3 - tv2 : 0), &stat_clk_debug2);
+	atomic64_inc(&stat_nr_debug2);
+	atomic64_add((u64)(tv4 - tv3 ? tv4 - tv3 : 0), &stat_clk_debug3);
+	atomic64_inc(&stat_nr_debug3);
+
 	return 0;
 }
 
@@ -1975,19 +1999,20 @@ ioctl_stat_info_command(StromCmd__StatInfo __user *uarg)
 	karg.nr_wrong_wakeup = atomic64_read(&stat_nr_wrong_wakeup);
 	karg.cur_dma_count	= atomic64_read(&stat_cur_dma_count);
 	karg.max_dma_count	= atomic64_xchg(&stat_max_dma_count, 0UL);
-#ifdef EXTRA_KSYMS_NEEDS_DEBUG_STATS
-	karg.has_debug		= 1;
-	karg.nr_debug1		= atomic64_read(p_stat_nr_debug1);
-	karg.clk_debug1		= atomic64_read(p_stat_clk_debug1);
-	karg.nr_debug2		= atomic64_read(p_stat_nr_debug2);
-	karg.clk_debug2		= atomic64_read(p_stat_clk_debug2);
-	karg.nr_debug3		= atomic64_read(p_stat_nr_debug3);
-	karg.clk_debug3		= atomic64_read(p_stat_clk_debug3);
-	karg.nr_debug4		= atomic64_read(p_stat_nr_debug4);
-	karg.clk_debug4		= atomic64_read(p_stat_clk_debug4);
-#else
-	karg.has_debug		= 0;
-#endif
+	if (stat_info == 1)
+		karg.has_debug	= 0;
+	else
+	{
+		karg.has_debug	= 1;
+		karg.nr_debug1	= atomic64_read(&stat_nr_debug1);
+		karg.clk_debug1	= atomic64_read(&stat_clk_debug1);
+		karg.nr_debug2	= atomic64_read(&stat_nr_debug2);
+		karg.clk_debug2	= atomic64_read(&stat_clk_debug2);
+		karg.nr_debug3	= atomic64_read(&stat_nr_debug3);
+		karg.clk_debug3	= atomic64_read(&stat_clk_debug3);
+		karg.nr_debug4	= atomic64_read(&stat_nr_debug4);
+		karg.clk_debug4	= atomic64_read(&stat_clk_debug4);
+	}
 	if (copy_to_user(uarg, &karg, sizeof(StromCmd__StatInfo)))
 		return -EFAULT;
 
