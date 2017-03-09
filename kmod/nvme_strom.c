@@ -62,7 +62,7 @@ static int	verbose = 0;
 module_param(verbose, int, 0644);
 MODULE_PARM_DESC(verbose, "turn on/off debug message");
 /* run-time statistics */
-static int	stat_info = 2;
+static int	stat_info = 1;
 module_param(stat_info, int, 0644);
 MODULE_PARM_DESC(stat_info, "turn on/off run-time statistics");
 static atomic64_t	stat_nr_ssd2gpu = ATOMIC64_INIT(0);
@@ -1032,11 +1032,8 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	u32						dsmgmt = 0;
 	u32						nblocks;
 	u64						slba;
-	u64						tv1, tv2, tv3, tv4;
 	dma_addr_t				prp1, prp2;
 	int						npages;
-
-	tv1 = rdtsc();
 
 	/* setup scatter-gather list */
 	length = (dtask->nr_sectors << SECTOR_SHIFT);
@@ -1059,8 +1056,6 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	async_cmd_cxt = kzalloc(sizeof(strom_async_cmd_context), GFP_KERNEL);
 	if (!async_cmd_cxt)
 		return -ENOMEM;
-
-	tv2 = rdtsc();
 
 	/* setup READ command */
 	cmd = &async_cmd_cxt->cmd.rw;
@@ -1092,20 +1087,9 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	async_cmd_cxt->tv1		= rdtsc();
 	req->end_io_data		= async_cmd_cxt;
 
-	tv3 = rdtsc();
-
 	/* throw asynchronous i/o request */
 	blk_execute_rq_nowait(nvme_ns->queue, nvme_ns->disk, req, 0,
 						  __callback_async_read_cmd);
-
-	tv4 = rdtsc();
-	atomic64_add((u64)(tv2 - tv1 ? tv2 - tv1 : 0), &stat_clk_debug1);
-	atomic64_inc(&stat_nr_debug1);
-	atomic64_add((u64)(tv3 - tv2 ? tv3 - tv2 : 0), &stat_clk_debug2);
-	atomic64_inc(&stat_nr_debug2);
-	atomic64_add((u64)(tv4 - tv3 ? tv4 - tv3 : 0), &stat_clk_debug3);
-	atomic64_inc(&stat_nr_debug3);
-
 	return 0;
 }
 
