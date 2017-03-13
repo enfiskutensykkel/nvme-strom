@@ -704,8 +704,11 @@ ioctl_alloc_dma_buffer(StromCmd__AllocDMABuffer __user *uarg)
 	return 0;
 
 error:
+	prError("failed on ioctl_alloc_dma_buffer (%d)", fdesc);
 	for (i=0; i < sd_buf->nr_segments; i++)
 	{
+		if (!sd_buf->dma_segments[i])
+			break;
 		for (j=0; j < sd_buf->segment_sz; j++)
 			__free_page(sd_buf->dma_segments[i] + j);
 	}
