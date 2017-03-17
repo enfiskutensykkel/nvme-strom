@@ -270,7 +270,7 @@ static int
 __mdblock_is_supported_nvme(struct block_device *blkdev,
 							int *p_numa_node_id,
 							int *p_support_dma64,
-							struct r0conf **p_raid0_conf)
+							struct mddev **p_mddev)
 {
 	struct gendisk *bd_disk = blkdev->bd_disk;
 	const char	   *dname;
@@ -353,8 +353,8 @@ __mdblock_is_supported_nvme(struct block_device *blkdev,
 	}
 
 	/* ok, MD RAID-0 volume consists of all NVMe-SSD devices */
-	if (p_raid0_conf)
-		*p_raid0_conf = mddev->private;
+	if (p_mddev)
+		*p_mddev = mddev;
 
 	return 0;
 }
@@ -366,7 +366,7 @@ static int
 file_is_supported_nvme(struct file *filp,
 					   int *p_numa_node_id,
 					   int *p_support_dma64,
-					   struct r0conf **p_raid0_conf)
+					   struct mddev **p_mddev)
 {
 	struct inode	   *f_inode = filp->f_inode;
 	struct super_block *i_sb = f_inode->i_sb;
@@ -450,7 +450,7 @@ file_is_supported_nvme(struct file *filp,
 		return __mdblock_is_supported_nvme(s_bdev,
 										   p_numa_node_id,
 										   p_support_dma64,
-										   p_raid0_conf);
+										   p_mddev);
 
 	prError("block device '%s' on behalf of the file is not supported",
 			bd_disk->disk_name);
@@ -523,7 +523,7 @@ struct strom_dma_task
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
 	/* MD RAID-0 configuration, if any */
-	struct r0conf	   *raid0_conf;
+	struct mddev	   *mddev;
 	/* current focus of the raw NVMe-SSD device */
 	struct nvme_ns	   *nvme_ns;	/* NVMe namespace (=SCSI LUN) */
 
@@ -583,7 +583,7 @@ strom_create_dma_task(int fdesc,
 	struct file			   *filp;
 	struct super_block	   *i_sb;
 	struct block_device	   *s_bdev;
-	struct r0conf		   *raid0_conf = NULL;
+	struct mddev		   *mddev = NULL;
 	int						node_id = -2;
 	int						support_dma64 = 1;
 	long					retval;
@@ -604,7 +604,7 @@ strom_create_dma_task(int fdesc,
 	retval = file_is_supported_nvme(filp,
 									&node_id,
 									&support_dma64,
-									&raid0_conf);
+									&mddev);
 	if (retval < 0)
 	{
 		fput(filp);
@@ -627,7 +627,7 @@ strom_create_dma_task(int fdesc,
     dtask->mgmem		= mgmem;
 	dtask->sd_buf		= sd_buf;
     dtask->filp			= filp;
-	dtask->raid0_conf	= raid0_conf;
+	dtask->mddev		= mddev;
 	dtask->nvme_ns		= NULL;		/* to be set later */
     dtask->dma_status	= 0;
     dtask->ioctl_filp	= get_file(ioctl_filp);
@@ -639,7 +639,7 @@ strom_create_dma_task(int fdesc,
 	 * If no MD RAID-0 configuration here, the focused NVMe-SSD will not be
 	 * changed during execution. So, we setup nvme_ns here.
 	 */
-	if (!raid0_conf)
+	if (!mddev)
 	{
 		struct gendisk	   *bd_disk = s_bdev->bd_disk;
 
@@ -754,11 +754,11 @@ find_zone(struct r0conf *conf, sector_t *p_sector)
 }
 
 static struct nvme_ns *
-strom_raid0_map_sector(struct r0conf *raid0_conf,
-					   struct mddev *mddev,
+strom_raid0_map_sector(struct mddev *mddev,
 					   sector_t *p_sector,
 					   unsigned int nr_sects)
 {
+	struct r0conf	   *raid0_conf = mddev->private;
 	struct strip_zone  *zone;
 	struct md_rdev	   *rdev;
 	sector_t			sector = *p_sector;
@@ -982,8 +982,10 @@ strom_prps_item_free(strom_prps_item *pitem)
 struct strom_async_cmd_context {
 	strom_prps_item	   *pitem;
 	strom_dma_task	   *dtask;
+	struct mddev	   *mddev;	/* md-raid0 device, if any */
 	struct nvme_command	cmd;	/* NVMe command */
 	uint64_t			tv1;	/* TSC value when DMA submit */
+	uint32_t			nr_sectors;
 };
 typedef struct strom_async_cmd_context strom_async_cmd_context;
 
@@ -1007,6 +1009,30 @@ __callback_async_read_cmd(struct request *req, int error)
 		atomic64_inc(&stat_nr_ssd2gpu);
 		atomic64_add((u64)(tv2 > tv1 ? tv2 - tv1 : 0), &stat_clk_ssd2gpu);
 		atomic64_dec(&stat_cur_dma_count);
+	}
+	/* update common statistics, if success */
+	if (!status)
+	{
+		struct hd_struct *part = &req->rq_disk->part0;
+		strom_dma_task *dtask = async_cxt->dtask;
+		unsigned long	duration = jiffies - req->start_time;
+		unsigned int	nr_sectors = async_cxt->nr_sectors;
+		int				cpu = part_stat_lock();
+
+		part_stat_add(cpu, part, sectors[0], nr_sectors);
+		part_stat_inc(cpu, part, ios[0]);
+		part_stat_add(cpu, part, ticks[0], duration);
+
+		/* also update statistics of md-raid0 device */
+		if (dtask->mddev)
+		{
+			struct gendisk *md_disk = dtask->mddev->gendisk;
+
+			part_stat_add(cpu, &md_disk->part0, sectors[0], nr_sectors);
+			part_stat_inc(cpu, &md_disk->part0, ios[0]);
+			part_stat_add(cpu, &md_disk->part0, ticks[0], duration);
+		}
+		part_stat_unlock();
 	}
 	strom_prps_item_free(async_cxt->pitem);
 	strom_put_dma_task(async_cxt->dtask, status);
@@ -1084,7 +1110,9 @@ __submit_async_read_cmd(strom_dma_task *dtask, strom_prps_item *pitem)
 	}
 	async_cmd_cxt->pitem	= pitem;
 	async_cmd_cxt->dtask	= strom_get_dma_task(dtask);
+	async_cmd_cxt->mddev	= NULL;
 	async_cmd_cxt->tv1		= rdtsc();
+	async_cmd_cxt->nr_sectors = dtask->nr_sectors;
 	req->end_io_data		= async_cmd_cxt;
 
 	/* throw asynchronous i/o request */
@@ -1321,13 +1349,11 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 		 * The logic to map block number is equivalent to find_zone() and
 		 * map_sector() at drivers/md/raid0.c.
 		 */
-		if (dtask->raid0_conf)
+		if (dtask->mddev)
 		{
-			struct gendisk *bd_disk = blkdev->bd_disk;
-			struct mddev   *mddev = bd_disk->private_data;
+			WARN_ON(dtask->mddev != blkdev->bd_disk->private_data);
 
-			nvme_ns = strom_raid0_map_sector(dtask->raid0_conf,
-											 mddev,
+			nvme_ns = strom_raid0_map_sector(dtask->mddev,
 											 &sector,
 											 nr_sects);
 			if (IS_ERR(nvme_ns))
