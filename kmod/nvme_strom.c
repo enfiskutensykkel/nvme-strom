@@ -117,7 +117,6 @@ atomic64_max_return(long newval, atomic64_t *atomic_ptr)
 	printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__)
 
 /* routines for extra symbols */
-#define EXTRA_KSYMS_NEEDS_NVIDIA		1
 #include "extra_ksyms.c"
 
 /*

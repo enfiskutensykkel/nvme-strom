@@ -10,7 +10,6 @@
 #error Linux kernel must be built with CONFIG_KALLSYMS
 #endif
 
-#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
 /* nvidia_p2p_get_pages */
 static struct module *mod_nvidia_p2p_get_pages = NULL;
 static int (* p_nvidia_p2p_get_pages)(
@@ -31,7 +30,8 @@ __nvidia_p2p_get_pages(uint64_t p2p_token,
 					   void (*free_callback)(void *data),
 					   void *data)
 {
-	BUG_ON(!p_nvidia_p2p_get_pages);
+	if (!p_nvidia_p2p_get_pages)
+		return -ENOTSUPP;
 	return p_nvidia_p2p_get_pages(p2p_token,
 								  va_space,
 								  virtual_address,
@@ -55,7 +55,8 @@ __nvidia_p2p_put_pages(uint64_t p2p_token,
 					   uint64_t virtual_address,
 					   struct nvidia_p2p_page_table *page_table)
 {
-	BUG_ON(!p_nvidia_p2p_put_pages);
+	if (!p_nvidia_p2p_put_pages)
+		return -ENOTSUPP;
 	return p_nvidia_p2p_put_pages(p2p_token,
 								  va_space,
 								  virtual_address,
@@ -70,10 +71,10 @@ static int (*p_nvidia_p2p_free_page_table)(
 static inline int
 __nvidia_p2p_free_page_table(struct nvidia_p2p_page_table *page_table)
 {
-	BUG_ON(!p_nvidia_p2p_free_page_table);
+	if (!p_nvidia_p2p_free_page_table)
+		return -ENOTSUPP;
 	return p_nvidia_p2p_free_page_table(page_table);
 }
-#endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
 
 /* nvme_alloc_request */
 static struct module *mod_nvme_alloc_request = NULL;
@@ -176,6 +177,10 @@ strom_update_extra_symbols(struct notifier_block *nb,
 										true);					\
 	} while(0)
 
+	/* nvidia */
+	LOOKUP_OPTIONAL_EXTRA_SYMBOL(nvidia_p2p_get_pages);
+	LOOKUP_OPTIONAL_EXTRA_SYMBOL(nvidia_p2p_put_pages);
+	LOOKUP_OPTIONAL_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
 	/* ext4 */
 	LOOKUP_OPTIONAL_EXTRA_SYMBOL(ext4_get_block);
 	/* xfs */
@@ -193,14 +198,12 @@ static struct notifier_block nvme_strom_nb = {
 static inline void
 strom_put_all_extra_modules(void)
 {
-#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
+	/* nvme */
+	module_put(mod_nvme_alloc_request);
 	/* nvidia */
 	module_put(mod_nvidia_p2p_get_pages);
 	module_put(mod_nvidia_p2p_put_pages);
 	module_put(mod_nvidia_p2p_free_page_table);
-#endif
-	/* nvme */
-	module_put(mod_nvme_alloc_request);
 	/* file systems */
 	module_put(mod_ext4_get_block);
 	module_put(mod_xfs_get_blocks);
@@ -235,19 +238,12 @@ strom_init_extra_symbols(void)
 			goto cleanup;										\
 	} while(0)
 
-#ifdef EXTRA_KSYMS_NEEDS_NVIDIA
-	/* nvidia.ko */
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_get_pages);
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_put_pages);
-	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvidia_p2p_free_page_table);
-#endif	/* EXTRA_KSYMS_NEEDS_NVIDIA */
 	/* nvme.ko */
 	LOOKUP_MANDATORY_EXTRA_SYMBOL(nvme_alloc_request);
 	/* notifier to get optional extra symbols */
 	rc = register_module_notifier(&nvme_strom_nb);
 	if (rc)
 		goto cleanup;
-
 	return 0;
 
 cleanup:
