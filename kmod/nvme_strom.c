@@ -1216,20 +1216,20 @@ out:
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_WAIT
  */
 static int
-ioctl_memcpy_wait(StromCmd__MemCpyWait __user *uarg,
+ioctl_memcpy_wait(StromCmd__MemCopyWait __user *uarg,
 				  struct file *ioctl_filp)
 {
-	StromCmd__MemCpyWait karg;
+	StromCmd__MemCopyWait karg;
 	long		retval;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpyWait)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCopyWait)))
 		return -EFAULT;
 
 	karg.status = 0;
 	retval = strom_dma_task_wait(karg.dma_task_id,
 								 &karg.status,
 								 TASK_INTERRUPTIBLE);
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__MemCpyWait)))
+	if (copy_to_user(uarg, &karg, sizeof(StromCmd__MemCopyWait)))
 		return -EFAULT;
 
 	return retval;
@@ -1484,7 +1484,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
  * main logic of STROM_IOCTL__MEMCPY_SSD2GPU
  */
 static int
-do_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu *karg,
+do_memcpy_ssd2gpu(StromCmd__MemCopySsdToGpu *karg,
 				  strom_dma_task *dtask,
 				  uint32_t *chunk_ids_in,
 				  uint32_t *chunk_ids_out)
@@ -1606,17 +1606,17 @@ do_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu *karg,
  * ioctl(2) handler for STROM_IOCTL__MEMCPY_SSD2GPU
  */
 static int
-ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg,
+ioctl_memcpy_ssd2gpu(StromCmd__MemCopySsdToGpu __user *uarg,
 					 struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToGpu karg;
+	StromCmd__MemCopySsdToGpu karg;
 	mapped_gpu_memory  *mgmem;
 	strom_dma_task	   *dtask;
 	uint32_t		   *chunk_ids_in = NULL;
 	uint32_t		   *chunk_ids_out = NULL;
 	int					retval;
 
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCpySsdToGpu)))
+	if (copy_from_user(&karg, uarg, sizeof(StromCmd__MemCopySsdToGpu)))
 		return -EFAULT;
 	chunk_ids_in = kmalloc(2 * sizeof(uint32_t) * karg.nr_chunks, GFP_KERNEL);
 	if (!chunk_ids_in)
@@ -1664,7 +1664,7 @@ ioctl_memcpy_ssd2gpu(StromCmd__MemCpySsdToGpu __user *uarg,
 	if (!retval)
 	{
 		if (copy_to_user(uarg, &karg,
-						 offsetof(StromCmd__MemCpySsdToGpu, handle)))
+						 offsetof(StromCmd__MemCopySsdToGpu, handle)))
 			retval = -EFAULT;
 		else if (copy_to_user(karg.chunk_ids, chunk_ids_out,
 							  sizeof(uint32_t) * karg.nr_chunks))
@@ -1763,7 +1763,7 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
  * do_memcpy_ssd2ram - main part of SSD-to-RAM DMA
  */
 static int
-do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
+do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 				  strom_dma_task *dtask,
 				  size_t dest_offset, uint32_t *chunk_ids)
 {
@@ -1888,10 +1888,10 @@ do_memcpy_ssd2ram(StromCmd__MemCpySsdToRam *karg,
  * ioctl_memcpy_ssd2ram - handler for STROM_IOCTL__MEMCPY_SSD2RAM
  */
 static int
-ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
+ioctl_memcpy_ssd2ram(StromCmd__MemCopySsdToRam __user *uarg,
 					 struct file *ioctl_filp)
 {
-	StromCmd__MemCpySsdToRam karg;
+	StromCmd__MemCopySsdToRam karg;
 	struct vm_area_struct  *vma = NULL;
 	struct mm_struct	   *mm = current->mm;
 	strom_dma_buffer	   *sd_buf;
@@ -1969,7 +1969,7 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCpySsdToRam __user *uarg,
 	if (!retval)
 	{
 		if (copy_to_user(uarg, &karg,
-						 offsetof(StromCmd__MemCpySsdToRam, dest_uaddr)))
+						 offsetof(StromCmd__MemCopySsdToRam, dest_uaddr)))
 			retval = -EFAULT;
 	}
 	/* synchronization of completion if any error */

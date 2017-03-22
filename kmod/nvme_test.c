@@ -201,19 +201,19 @@ typedef struct
 	CUstream		cuda_stream;
 	void		   *src_buffer;
 	void		   *dest_buffer;
-	StromCmd__MemCpySsdToGpu uarg;
+	StromCmd__MemCopySsdToGpu uarg;
 } async_task;
 
 static void
 callback_dma_wait(CUstream cuda_stream, CUresult status, void *private)
 {
-	StromCmd__MemCpyWait uarg;
+	StromCmd__MemCopyWait uarg;
 	async_task	   *atask = private;
 	int				rv;
 
 	cuda_exit_on_error(status, "async_task");
 
-	memset(&uarg, 0, sizeof(StromCmd__MemCpyWait));
+	memset(&uarg, 0, sizeof(StromCmd__MemCopyWait));
 	uarg.dma_task_id = atask->uarg.dma_task_id;
 	rv = nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &uarg);
 	if (uarg.status)
@@ -290,7 +290,7 @@ setup_async_tasks(int fdesc, unsigned long handle)
 
 	for (i=0; i < nr_segments; i++)
 	{
-		StromCmd__MemCpySsdToGpu  *uarg;
+		StromCmd__MemCopySsdToGpu  *uarg;
 
 		uarg = &async_tasks[i].uarg;
 

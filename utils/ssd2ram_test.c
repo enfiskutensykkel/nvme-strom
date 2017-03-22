@@ -134,7 +134,7 @@ alloc_dma_buffer(int node_id)
 static void *
 ssd2ram_worker(void *__args__)
 {
-	StromCmd__MemCpySsdToRam cmd;
+	StromCmd__MemCopySsdToRam cmd;
 	char	   *dma_buffer;
 	unsigned long *dma_tasks;
 	uint32_t   *chunk_ids;
@@ -170,7 +170,7 @@ ssd2ram_worker(void *__args__)
 		i = rindex++ % n_units;
 		if (i == windex)
 		{
-			StromCmd__MemCpyWait	__cmd;
+			StromCmd__MemCopyWait	__cmd;
 
 			gettimeofday(&tv1, NULL);
 			memset(&__cmd, 0, sizeof(__cmd));

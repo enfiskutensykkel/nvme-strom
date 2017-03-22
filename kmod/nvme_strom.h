@@ -81,7 +81,7 @@ typedef struct StromCmd__InfoGpuMemory
 } StromCmd__InfoGpuMemory;
 
 /* STROM_IOCTL__MEMCPY_SSD2GPU */
-typedef struct StromCmd__MemCpySsdToGpu
+typedef struct StromCmd__MemCopySsdToGpu
 {
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2gpu;	/* out: # of RAM2GPU chunks */
@@ -99,17 +99,17 @@ typedef struct StromCmd__MemCpySsdToGpu
 	char __user	   *wb_buffer;	/* in: write-back buffer in user space;
 								 * consumed from the tail, and must be at least
 								 * chunk_sz * nr_chunks bytes. */
-} StromCmd__MemCpySsdToGpu;
+} StromCmd__MemCopySsdToGpu;
 
 /* STROM_IOCTL__MEMCPY_WAIT */
-typedef struct StromCmd__MemCpyWait
+typedef struct StromCmd__MemCopyWait
 {
 	unsigned long	dma_task_id;/* in: ID of the DMA task to wait */
 	long			status;		/* out: status of the DMA task */
-} StromCmd__MemCpyWait;
+} StromCmd__MemCopyWait;
 
 /* STROM_IOCTL__MEMCPY_SSD2RAM */
-typedef struct StromCmd__MemCpySsdToRam
+typedef struct StromCmd__MemCopySsdToRam
 {
 	unsigned long	dma_task_id;/* out: ID of the DMA task */
 	unsigned int	nr_ram2ram; /* out: # of RAM2RAM chunks */
@@ -127,7 +127,7 @@ typedef struct StromCmd__MemCpySsdToRam
 								 *     in PostgreSQL). 0 means no boundary. */
 	uint32_t __user *chunk_ids;	/* in: # of chunks per file (RELSEG_SIZE in
 								 *     PostgreSQL). 0 means no boundary. */
-} StromCmd__MemCpySsdToRam;
+} StromCmd__MemCopySsdToRam;
 
 /* STROM_IOCTL__ALLOC_DMA_BUFFER */
 typedef struct StromCmd__AllocDMABuffer
