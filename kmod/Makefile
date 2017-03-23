@@ -32,7 +32,8 @@ USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
 EXTRA_CLEAN := nvme_test
 
 KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c pmemmap.c \
-	$(shell ls $(M)/*/md.h $(M)/*/raid0.h $(M)/*/nvme.h)
+	rhel7_local.h \
+	$(shell cd $(M) && ls */md.h */raid0.h */nvme.h)
 
 obj-m := nvme_strom.o
 ccflags-y := -I. -I$(NVIDIA_SOURCE) 				\
@@ -53,15 +54,16 @@ nvme_test: nvme_test.c nvme_strom.h
 #
 install-dkms:
 	mkdir -p $(DKMS_DEST)
-	install -m 0644 dkms.conf Makefile $(KMOD_SOURCE) $(DKMS_DEST)
-	install -m 0644 nvme_strom.modprobe.conf /etc/modprobe.d
-	install -m 0644 nvme_strom.modload.conf  /etc/modules-load.d
+	@(cd $(M) && tar zc -p $(KMOD_SOURCE)) | (cd $(DKMS_DEST) && tar zxv)
+	install -m 0644 dkms.conf Makefile $(DKMS_DEST)
+	install -m 0644 nvme_strom.modprobe.conf /etc/modprobe.d/
+	install -m 0644 nvme_strom.modload.conf  /etc/modules-load.d/
 
 clean:
 	rm -f $(EXTRA_CLEAN)
 	$(MAKE) -C $(KERNEL_SOURCE) M=$(PWD) $@
 
-%:
+modules:
 	$(MAKE) -C $(KERNEL_SOURCE) \
 	KBUILD_EXTRA_SYMBOLS=$(NVIDIA_SOURCE)/Module.symvers \
 	NVIDIA_SOURCE=$(NVIDIA_SOURCE) M=$(PWD) $@
