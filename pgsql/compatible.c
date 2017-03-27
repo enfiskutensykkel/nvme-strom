@@ -153,7 +153,137 @@ compute_parallel_worker(RelOptInfo *rel,
 }
 #endif
 
+/*
+ * order_qual_clauses, at src/backend/optimizer/plan/createplan.c
+ *
+ *		Given a list of qual clauses that will all be evaluated at the same
+ *		plan node, sort the list into the order we want to check the quals
+ *		in at runtime.
+ *
+ * When security barrier quals are used in the query, we may have quals with
+ * different security levels in the list.  Quals of lower security_level
+ * must go before quals of higher security_level, except that we can grant
+ * exceptions to move up quals that are leakproof.  When security level
+ * doesn't force the decision, we prefer to order clauses by estimated
+ * execution cost, cheapest first.
+ *
+ * Ideally the order should be driven by a combination of execution cost and
+ * selectivity, but it's not immediately clear how to account for both,
+ * and given the uncertainty of the estimates the reliability of the decisions
+ * would be doubtful anyway.  So we just order by security level then
+ * estimated per-tuple cost, being careful not to change the order when
+ * (as is often the case) the estimates are identical.
+ *
+ * Although this will work on either bare clauses or RestrictInfos, it's
+ * much faster to apply it to RestrictInfos, since it can re-use cost
+ * information that is cached in RestrictInfos.  XXX in the bare-clause
+ * case, we are also not able to apply security considerations.  That is
+ * all right for the moment, because the bare-clause case doesn't occur
+ * anywhere that barrier quals could be present, but it would be better to
+ * get rid of it.
+ *
+ * Note: some callers pass lists that contain entries that will later be
+ * removed; this is the easiest way to let this routine see RestrictInfos
+ * instead of bare clauses.  This is another reason why trying to consider
+ * selectivity in the ordering would likely do the wrong thing.
+ */
+static List *
+order_qual_clauses(PlannerInfo *root, List *clauses)
+{
+	typedef struct
+	{
+		Node	   *clause;
+		Cost		cost;
+#if PG_VERSION_NUM >= 100000
+		Index		security_level;
+#endif
+	} QualItem;
+	int			nitems = list_length(clauses);
+	QualItem   *items;
+	ListCell   *lc;
+	int			i;
+	List	   *result;
 
+	/* No need to work hard for 0 or 1 clause */
+	if (nitems <= 1)
+		return clauses;
+
+	/*
+	 * Collect the items and costs into an array.  This is to avoid repeated
+	 * cost_qual_eval work if the inputs aren't RestrictInfos.
+	 */
+	items = (QualItem *) palloc(nitems * sizeof(QualItem));
+	i = 0;
+	foreach(lc, clauses)
+	{
+		Node	   *clause = (Node *) lfirst(lc);
+		QualCost	qcost;
+
+		cost_qual_eval_node(&qcost, clause, root);
+		items[i].clause = clause;
+		items[i].cost = qcost.per_tuple;
+#if PG_VERSION_NUM >= 100000
+		if (IsA(clause, RestrictInfo))
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) clause;
+
+			/*
+			 * If a clause is leakproof, it doesn't have to be constrained by
+			 * its nominal security level.  If it's also reasonably cheap
+			 * (here defined as 10X cpu_operator_cost), pretend it has
+			 * security_level 0, which will allow it to go in front of
+			 * more-expensive quals of lower security levels.  Of course, that
+			 * will also force it to go in front of cheaper quals of its own
+			 * security level, which is not so great, but we can alleviate
+			 * that risk by applying the cost limit cutoff.
+			 */
+			if (rinfo->leakproof && items[i].cost < 10 * cpu_operator_cost)
+				items[i].security_level = 0;
+			else
+				items[i].security_level = rinfo->security_level;
+		}
+		else
+			items[i].security_level = 0;
+#endif
+		i++;
+	}
+
+	/*
+	 * Sort.  We don't use qsort() because it's not guaranteed stable for
+	 * equal keys.  The expected number of entries is small enough that a
+	 * simple insertion sort should be good enough.
+	 */
+	for (i = 1; i < nitems; i++)
+	{
+		QualItem	newitem = items[i];
+		int			j;
+
+		/* insert newitem into the already-sorted subarray */
+		for (j = i; j > 0; j--)
+		{
+#if PG_VERSION_NUM < 100000
+			if (newitem.cost >= items[j - 1].cost)
+				items[j] = items[j - 1];
+#else
+			QualItem   *olditem = &items[j - 1];
+
+			if (newitem.security_level > olditem->security_level ||
+				(newitem.security_level == olditem->security_level &&
+				 newitem.cost >= olditem->cost))
+				break;
+			items[j] = *olditem;
+#endif
+		}
+		items[j] = newitem;
+	}
+
+	/* Convert back to a list */
+	result = NIL;
+	for (i = 0; i < nitems; i++)
+		result = lappend(result, items[i].clause);
+
+	return result;
+}
 
 
 

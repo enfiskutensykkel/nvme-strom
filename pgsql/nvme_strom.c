@@ -34,13 +34,48 @@ PG_MODULE_MAGIC;
 void	_PG_init(void);
 
 static set_rel_pathlist_hook_type set_rel_pathlist_next;
-static CustomPathMethods	ssdscan_path_methods;
-static CustomScanMethods	ssdscan_plan_methods;
-static CustomExecMethods	ssdscan_exec_methods;
-static bool					enable_ssdscan;
+static CustomPathMethods	nvmestrom_path_methods;
+static CustomScanMethods	nvmestrom_plan_methods;
+static CustomExecMethods	nvmestrom_exec_methods;
+static bool					nvmestrom_enabled;			/* GUC */
+static int					nvmestrom_chunk_size_kb;	/* GUC */
+static int					nvmestrom_buffer_size_kb;	/* GUC */
 static long					sysconf_pagesize;	/* _SC_PAGESIZE */
 static long					sysconf_phys_pages;	/* _SC_PHYS_PAGES */
 static long					ssdscan_threshold;
+
+/*
+ * Parallel Scan State of NVMEStrom
+ */
+typedef struct NVMEStromParallelDesc
+{
+	Oid			nss_relid;		/* OID of relation to scan */
+	BlockNumber	nss_nblocks;	/* # blocks in relation at start of scan */
+	pg_atomic_uint64 nss_cblock;/* current block number */
+	size_t		nss_chunk_sz;	/* nvme_strom.chunk_size in bytes */
+	size_t		nss_buffer_sz;	/* nvme_strom.buffer_size in bytes */
+	char		nss_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
+} NVMEStromParallelDesc;
+
+/*
+ * Executor State of NVMEStrom
+ */
+typedef struct NVMEStromState {
+	CustomScanState css;
+	NVMEStromParallelDesc *pdesc;
+	BlockNumber	nss_nblocks;	/* # blocks in relation at start of scan */
+	BlockNumber	nss_cblock;		/* current block number */
+
+
+	File		ioctl_filp;
+	size_t		chunk_sz;		/* unit size of chunks */
+	int			chunk_nums;		/* number of chunks */
+	char	   *chunk_buffer;	/* mapped DMA buffer */
+
+	int			dma_rindex;		/* index to read next */
+	int			dma_windex;		/* index to stpre next */
+	unsigned long dma_tasks[FLEXIBLE_ARRAY_MEMBER];
+} NVMEStromState;
 
 /*
  * Misc utility functions for multi version supports
@@ -132,24 +167,6 @@ create_ssdscan_path(PlannerInfo *root,
 					int parallel_workers)
 {
 	CustomPath	   *cpath = makeNode(CustomPath);
-	Path		   *spath = makeNode(Path);
-
-	/*
-	 * NOTE: Some of optimizer functions are declared as static function,
-	 * thus, extension cannot call them and need to cut & paste. However,
-	 * these are just maintenance burden for us.
-	 * So, we make optimizer construct a simple/equivalent plan, then
-	 * pick up its structure for our use.
-	 */
-	spath->pathtype = T_SeqScan;
-	spath->parent = rel;
-	spath->pathtarget = rel->reltarget;
-	spath->param_info = get_baserel_parampathinfo(root, rel,
-												  required_outer);
-    spath->parallel_aware = parallel_workers > 0 ? true : false;
-    spath->parallel_safe = rel->consider_parallel;
-    spath->parallel_workers = parallel_workers;
-    spath->pathkeys = NIL;
 
 	/* construction of CustomPath */
 	cpath->path.pathtype	= T_CustomScan;
@@ -162,9 +179,9 @@ create_ssdscan_path(PlannerInfo *root,
 	cpath->path.parallel_workers = parallel_workers;
 	cpath->path.pathkeys	= NIL;
 	cpath->flags			= 0;
-	cpath->custom_paths		= list_make1(spath);
+	cpath->custom_paths		= NIL;
 	cpath->custom_private	= NIL;
-	cpath->methods			= &ssdscan_path_methods;
+	cpath->methods			= &nvmestrom_path_methods;
 	cost_ssdscan(&cpath->path, root, rel, cpath->path.param_info);
 
 	return cpath;
@@ -182,7 +199,7 @@ ssdscan_add_scan_path(PlannerInfo *root,
 	CustomPath	   *cpath;
 	Relids			required_outer = rel->lateral_relids;
 
-	if (!enable_ssdscan)
+	if (!nvmestrom_enabled)
 		return;
 	/* make no sense, if table size is capable to load RAM */
 	if (rel->pages < ssdscan_threshold)
@@ -208,115 +225,188 @@ ssdscan_add_scan_path(PlannerInfo *root,
 }
 
 /*
- * PlanSSDScanPath
+ * PlanNVMEStromPath
  */
 static Plan *
-PlanSSDScanPath(PlannerInfo *root,
-				RelOptInfo *rel,
-				struct CustomPath *best_path,
-				List *tlist,
-				List *clauses,
-				List *custom_plans)
+PlanNVMEStromPath(PlannerInfo *root,
+				  RelOptInfo *rel,
+				  struct CustomPath *best_path,
+				  List *tlist,
+				  List *clauses,
+				  List *custom_plans)
 {
 	CustomScan *cscan;
-	SeqScan	   *sscan;
 	Index		scan_relid = rel->relid;
 
 	/* it should be a base rel... */
 	Assert(scan_relid > 0);
 	Assert(rel->rtekind == RTE_RELATION);
-	Assert(list_length(custom_plans) == 1);
-	sscan = linitial(custom_plans);
+
+	/* Sort clauses into best execution order */
+	clauses = order_qual_clauses(root, clauses);
+
+	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
+	clauses = extract_actual_clauses(clauses, false);
 
 	/* make a custom scan node */
 	cscan = makeNode(CustomScan);
 	cscan->scan.plan.targetlist	= tlist;
-	cscan->scan.plan.qual		= sscan->plan.qual;
+	cscan->scan.plan.qual		= clauses;
 	cscan->scan.plan.lefttree	= NULL;
 	cscan->scan.plan.righttree	= NULL;
 	cscan->scan.scanrelid		= scan_relid;
 	cscan->flags				= best_path->flags;
-	cscan->methods				= &ssdscan_plan_methods;
+	cscan->methods				= &nvmestrom_plan_methods;
 
 	return &cscan->scan.plan;
 }
 
 /*
- * CreateSSDScanState
+ * CreateNVMEStromState
  */
 static Node *
-CreateSSDScanState(CustomScan *cscan)
+CreateNVMEStromState(CustomScan *cscan)
 {
-	return NULL;
+	NVMEStromState *nss = palloc0(sizeof(NVMEStromState));
+
+	NodeSetTag(nss, T_CustomScanState);
+	nss->css.methods = &nvmestrom_exec_state;
+
+	return (Node *) nss;
 }
 
 /*
- * ExecInitSSDScan
+ * ExecInitNVMEStrom
  */
 static void
-ExecInitSSDScan(CustomScanState *node,
-				EState *estate,
-				int eflags)
+ExecInitNVMEStrom(CustomScanState *node,
+				  EState *estate,
+				  int eflags)
+{
+	NVMEStromState *nss = (NVMEStromState *) node;
+
+	// init extra attributes here
+	// common portions are already initialized by core
+	
+}
+
+static void
+InitNVMEStromScanDesc()
 {}
 
 /*
- * ExecSSDScan
+ * ExecNVMEStrom
  */
 static TupleTableSlot *
-ExecSSDScan(CustomScanState *node)
+ExecNVMEStrom(CustomScanState *node)
 {
+	// init scan descriptor on the first call
+
+
+
 	return NULL;
 }
 
 /*
- * EndCustomScan
+ * ExecEndNVMEStrom
  */
 static void
-ExecEndSSDScan(CustomScanState *node)
-{}
+ExecEndNVMEStrom(CustomScanState *node)
+{
+	// clear extra attributes
+}
 
 /*
- * ReScanCustomScan
+ * ExecReScanNVMEStrom
  */
 static void
-ExecReScanSSDScan(CustomScanState *node)
-{}
+ExecReScanNVMEStrom(CustomScanState *node)
+{
+	// revert scan pointer
+
+}
 
 /*
- * ExecSSDScanEstimateDSM
+ * ExecNVMEStromEstimateDSM
  */
 static Size
-ExecSSDScanEstimateDSM(CustomScanState *node,
-					   ParallelContext *pcxt)
+ExecNVMEStromEstimateDSM(CustomScanState *node,
+						 ParallelContext *pcxt)
 {
+	EState	   *estate = node->ss.ps.state;
+
+	node->pscan_len = add_size(offsetof(NVMEStromParallelDesc,
+										nss_snapshot_data),
+							   EstimateSnapshotSpace(snapshot));
+	shm_toc_estimate_chunk(&pcxt->estimator, node->pscan_len);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+
 	return 0;
 }
 
 /*
- * ExecSSDScanInitDSM
+ * NVMEStromBeginParallelScan
  */
 static void
-ExecSSDScanInitDSM(CustomScanState *node,
-				   ParallelContext *pcxt,
-				   void *coordinate)
-{}
+NVMEStromBeginParallelScan(NVMEStromState *nss,
+						   NVMEStromParallelDesc *nsp_desc)
+{
+}
 
 /*
- * ExecSSDScanInitWorker
+ * ExecNVMEStromInitDSM
  */
 static void
-ExecSSDScanInitWorker(CustomScanState *node,
-					  shm_toc *toc,
-					  void *coordinate)
-{}
+NVMEStromInitDSM(CustomScanState *node,
+				 ParallelContext *pcxt,
+				 void *coordinate)
+{
+	NVMEStromState *nss = (NVMEStromState *) node;
+	NVMEStromParallelDesc *nsp_desc;
+	Relation		relation = nss->css.ss.ss_currentRelation;
+	Snapshot		snapshot = nss->css.ss.ps.state->es_snapshot;
+
+	nsp_desc = shm_toc_allocate(pcxt->toc, nss->css.pscan_len);
+	/* init NVMEStromParallelDesc */
+	nsp_desc->nss_relid = RelationGetRelid(relation);
+	nsp_desc->nss_nblocks = RelationGetNumberOfBlocks(relation);
+	pg_atomic_init_u64(&nsp_desc->nss_cblock, 0);
+	nsp_desc->nss_chunk_sz = (size_t)nvmestrom_chunk_size_kb << 10;
+	nsp_desc->nss_buffer_sz = (size_t)nvmestrom_buffer_size_kb << 10;
+	SerializeSnapshot(snapshot, nsp_desc->nsp_snaphot_data);
+
+	/* share with background workers */
+	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, nsp_desc);
+	nss->nsp_desc = nsp_desc;
+}
 
 /*
- * ExplainSSDScan
+ * NVMEStromInitWorker
  */
 static void
-ExplainSSDScan(CustomScanState *node,
-			   List *ancestors,
-			   ExplainState *es)
+NVMEStromInitWorker(CustomScanState *node,
+					shm_toc *toc,
+					void *coordinate)
+{
+	NVMEStromState *nss = (NVMEStromState *) node;
+	NVMEStromParallelDesc  *nsp_desc;
+	Relation		relation = nss->css.ss.ss_currentRelation;
+	Snapshot		snapshot;
+
+	/* restore the snapshot */
+	nsp_desc = shm_toc_lookup(toc, node->ss.ps.plan->plan_node_id);
+	Assert(RelationGetRelid(relation) == nsp_desc->nsp_relid);
+	snapshot = RestoreSnapshot(nsp_desc->nsp_snaphot_data);
+	RegisterSnapshot(snapshot);
+}
+
+/*
+ * ExplainNVMEStrom
+ */
+static void
+ExplainNVMEStrom(CustomScanState *node,
+				 List *ancestors,
+				 ExplainState *es)
 {}
 
 /*
@@ -345,36 +435,63 @@ _PG_init(void)
 						 shared_buffer_size) / BLCKSZ;
 
 	/* nvme_strom.enabled */
-	DefineCustomBoolVariable("nvme_strom.enable_ssdscan",
-							 "Enables direct SSD scan on NVMe-Strom",
+	DefineCustomBoolVariable("nvme_strom.enabled",
+							 "Enables/disables direct SSD scan by NVMe-Strom",
 							 NULL,
-							 &enable_ssdscan,
+							 &nvmestrom_enabled,
 							 true,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+	/* nvme_strom.chunk_size */
+	DefineCustomIntVariable("nvme_strom.chunk_size",
+							"Unit size of userspace mapped DMA buffer",
+							NULL,
+							&nvmestrom_chunk_size_kb,
+							32768,			/* 32MB */
+							BLCKSZ / 1024,	/* 8KB */
+							INT_MAX,
+							PGC_USERSET,
+							GUC_NOT_IN_SAMPLE | GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	/* nvme_strom.buffer_size */
+	DefineCustomIntVariable("nvme_strom.buffer_size",
+							"Total size of userspace mapped DMA buffer",
+							NULL,
+							&nvmestrom_buffer_size_kb,
+							262144,			/* 256MB */
+							BLCKSZ / 1024,	/* 8KB */
+							INT_MAX,
+							PGC_USERSET,
+							GUC_NOT_IN_SAMPLE | GUC_UNIT_KB,
+							NULL, NULL, NULL);
+	if (nvmestrom_chunk_size_kb % (BLCKSZ / 1024) != 0)
+		elog(ERROR, "nvme_strom.chunk_size must be multiple of BLCKSZ");
+	if (nvmestrom_buffer_size_kb % nvmestrom_chunk_size_kb != 0)
+		elog(ERROR, "nvme_strom.buffer_size must be multiple of nvme_strom.chunk_size");
+
 	/* setup path methods */
-	memset(&ssdscan_path_methods, 0, sizeof(CustomPathMethods));
-	ssdscan_path_methods.CustomName			= "NVMeSSD Scan";
-	ssdscan_path_methods.PlanCustomPath		= PlanSSDScanPath;
+	memset(&nvmestrom_path_methods, 0, sizeof(CustomPathMethods));
+	nvmestrom_path_methods.CustomName			= "NVMe Strom";
+	nvmestrom_path_methods.PlanCustomPath		= PlanNVMEStromPath;
 
 	/* setup plan methods */
-	memset(&ssdscan_plan_methods, 0, sizeof(CustomScanMethods));
-	ssdscan_plan_methods.CustomName			= "NVMeSSD Scan";
-	ssdscan_plan_methods.CreateCustomScanState = CreateSSDScanState;
-	RegisterCustomScanMethods(&ssdscan_plan_methods);
+	memset(&nvmestrom_plan_methods, 0, sizeof(CustomScanMethods));
+	nvmestrom_plan_methods.CustomName			= "NVMe Strom";
+	nvmestrom_plan_methods.CreateCustomScanState = CreateNVMEStromState;
+	RegisterCustomScanMethods(&nvmestrom_plan_methods);
 
 	/* setup exec methods */
-	memset(&ssdscan_exec_methods, 0, sizeof(CustomExecMethods));
-	ssdscan_exec_methods.CustomName			= "NVMeSSD Scan";
-	ssdscan_exec_methods.BeginCustomScan	= ExecInitSSDScan;
-	ssdscan_exec_methods.ExecCustomScan		= ExecSSDScan;
-	ssdscan_exec_methods.EndCustomScan		= ExecEndSSDScan;
-	ssdscan_exec_methods.ReScanCustomScan	= ExecReScanSSDScan;
-	ssdscan_exec_methods.EstimateDSMCustomScan = ExecSSDScanEstimateDSM;
-	ssdscan_exec_methods.InitializeDSMCustomScan = ExecSSDScanInitDSM;
-	ssdscan_exec_methods.InitializeWorkerCustomScan = ExecSSDScanInitWorker;
-	ssdscan_exec_methods.ExplainCustomScan	= ExplainSSDScan;
+	memset(&nvmestrom_exec_methods, 0, sizeof(CustomExecMethods));
+	nvmestrom_exec_methods.CustomName			= "NVMe Strom";
+	nvmestrom_exec_methods.BeginCustomScan		= ExecInitNVMEStrom;
+	nvmestrom_exec_methods.ExecCustomScan		= ExecNVMEStrom;
+	nvmestrom_exec_methods.EndCustomScan		= ExecEndNVMEStrom;
+	nvmestrom_exec_methods.ReScanCustomScan		= ExecReScanNVMEStrom;
+	nvmestrom_exec_methods.EstimateDSMCustomScan = ExecNVMEStromEstimateDSM;
+	nvmestrom_exec_methods.InitializeDSMCustomScan = NVMEStromInitDSM;
+	nvmestrom_exec_methods.InitializeWorkerCustomScan = NVMEStromInitWorker;
+	nvmestrom_exec_methods.ExplainCustomScan	= ExplainNVMEStrom;
 
 	/* hook registration */
 	set_rel_pathlist_next = set_rel_pathlist_hook;
