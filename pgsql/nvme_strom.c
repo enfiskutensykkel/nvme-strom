@@ -27,6 +27,7 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/subselect.h"
 #include "storage/bufmgr.h"
+#include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/pg_crc.h"
@@ -47,9 +48,10 @@ static set_rel_pathlist_hook_type set_rel_pathlist_next;
 static CustomPathMethods	nvmestrom_path_methods;
 static CustomScanMethods	nvmestrom_plan_methods;
 static CustomExecMethods	nvmestrom_exec_methods;
-static bool					nvmestrom_enabled;			/* GUC */
+static int					nvmestrom_enabled;			/* GUC */
 static int					nvmestrom_chunk_size_kb;	/* GUC */
 static int					nvmestrom_buffer_size_kb;	/* GUC */
+static double				nvmestrom_seq_page_cost;	/* GUC */
 static long					sysconf_pagesize;	/* _SC_PAGESIZE */
 static long					sysconf_phys_pages;	/* _SC_PHYS_PAGES */
 static long					nvmestrom_nblocks_threshold;
@@ -57,6 +59,38 @@ static HTAB				   *vfs_nvme_htable = NULL;
 static Oid					nvme_last_tablespace_oid = InvalidOid;
 static bool					nvme_last_tablespace_supported;
 static int					nvme_last_numa_node_id = -1;
+
+/* options for nvme_strom.enabled */
+static struct config_enum_entry nvmestrom_enabled_options[] = {
+	{ "on",      1, false },
+	{ "off",     0, false },
+	{ "true",    1,  true },
+	{ "false",   0,  true },
+	{ "1",       1,  true },
+	{ "0",       0,  true },
+	{ "always", -1,  true },
+	{ NULL, 0, false }
+};
+
+/*
+ * NVMEStromChunkBuffer
+ */
+typedef struct NVMEStromDMAChunk
+{
+	unsigned long	dma_task_id;/* handler of DMA task */
+	BlockNumber		block_pos;	/* block number begin to read */
+	unsigned int	num_blocks;	/* number of blocks to read */
+	char		   *chunk_buf;	/* mapped DMA buffer */
+	uint32_t	   *chunk_ids;	/* argument buffer for ioctl command */
+} NVMEStromDMAChunk;
+
+/* see storage/smgr/md.c */
+typedef struct _MdfdVec
+{
+	File			mdfd_vfd;       /* fd number in fd.c's pool */
+	BlockNumber		mdfd_segno;     /* segment number, from 0 */
+	struct _MdfdVec *mdfd_chain;    /* next segment, or NULL */
+} MdfdVec;
 
 /*
  * Parallel Scan State of NVMEStrom
@@ -67,8 +101,13 @@ typedef struct NVMEStromParallelDesc
 	BlockNumber	nsp_nblocks;	/* # blocks in relation at start of scan */
 	pg_atomic_uint64 nsp_cblock;/* current block number */
 
-	/* XXX statistics here XXX */
-
+#if PG_VERSION_NUM >= 100000
+	/* statistics are available since PostgreSQL v10.0 */
+	pg_atomic_uint64	nr_ram2ram;
+	pg_atomic_uint64	nr_ssd2ram;
+	pg_atomic_uint64	nr_dma_submit;
+	pg_atomic_uint64	nr_dma_blocks;
+#endif
 	char		nsp_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 } NVMEStromParallelDesc;
 
@@ -85,21 +124,22 @@ typedef struct NVMEStromState {
 	int			numa_node_id;	/* numa node id of NVMe-SSD device */
 	int			num_chunks;		/* number of chunk buffers */
 	size_t		chunk_sz;		/* nvme_strom.chunk_size in bytes */
-	char	   *chunk_bufs;		/* mapped DMA buffers */
-	int			curr_chunkid;	/* current index to DMA buffer */
-	int			curr_bindex;	/* current index to block on chunk */
-	int			curr_lindex;	/* current index to lineitem in a block */
 
-	/* state of asynchronous DMA tasks */
+	/* reference to system resources */
+	void	   *mmap_dma_buf;	/* mapped DMA buffers */
+	File	   *mdfd;			/* quick lookup table of relation's fd */
+
+	/* state of relation scan */
+	NVMEStromDMAChunk *curr_dchunk;
+	int			curr_bindex;
+	int			curr_lindex;
+
+	/* state of asynchronous scan with DMA */
 	bool		scan_done;		/* true, if already end of relation */
 	int			dma_rindex;		/* index to read next */
-	int			dma_windex;		/* index to stpre next */
-	int			num_dtasks;		/* number of DMA tasks not yet read */
-	struct {
-		unsigned long	handle;
-		BlockNumber		head_block;
-		unsigned int	num_blocks;
-	} dma_tasks[FLEXIBLE_ARRAY_MEMBER];
+	int			dma_windex;		/* index to write next */
+	int			free_chunks;	/* number of available chunks */
+	NVMEStromDMAChunk dma_chunks[FLEXIBLE_ARRAY_MEMBER];
 } NVMEStromState;
 
 /*
@@ -119,7 +159,12 @@ nvme_strom_ioctl(int cmd, const void *arg)
 	{
 		fdesc_nvme_strom = open(NVME_STROM_IOCTL_PATHNAME, O_RDONLY);
 		if (fdesc_nvme_strom < 0)
-			elog(ERROR, "failed to open \"%s\"", NVME_STROM_IOCTL_PATHNAME);
+		{
+			if (errno != ENOENT)
+				elog(ERROR, "failed to open \"%s\": %m",
+					 NVME_STROM_IOCTL_PATHNAME);
+			return errno;
+		}
 	}
 	return ioctl(fdesc_nvme_strom, cmd, arg);
 }
@@ -150,7 +195,8 @@ vfs_nvme_cache_callback(Datum arg, int cacheid, uint32 hashvalue)
  * tablespace_can_use_nvme_strom
  */
 static bool
-tablespace_can_use_nvme_strom(Oid tablespace_oid, int *p_numa_node_id)
+tablespace_can_use_nvme_strom(Oid tablespace_oid, int *p_numa_node_id,
+							  bool be_quiet)
 {
 	vfs_nvme_status *entry;
 	const char *pathname;
@@ -224,7 +270,7 @@ tablespace_can_use_nvme_strom(Oid tablespace_oid, int *p_numa_node_id)
 		}
 		else
 		{
-			ereport(NOTICE,
+			ereport((be_quiet ? DEBUG1 : NOTICE),
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("tablespace \"%s\" does not support NVMe-Strom",
 							get_tablespace_name(tablespace_oid))));
@@ -242,28 +288,33 @@ tablespace_can_use_nvme_strom(Oid tablespace_oid, int *p_numa_node_id)
  * relation_can_use_nvme_strom
  */
 static bool
-relation_can_use_nvme_strom(Relation relation, int *p_numa_node_id)
+relation_can_use_nvme_strom(Relation relation,
+							int *p_numa_node_id,
+							bool be_quiet)
 {
 	Oid		tablespace_oid = RelationGetForm(relation)->reltablespace;
 
-	return tablespace_can_use_nvme_strom(tablespace_oid, p_numa_node_id);
+	return tablespace_can_use_nvme_strom(tablespace_oid,
+										 p_numa_node_id,
+										 be_quiet);
 }
 
 /*
- * cost_ssdscan
+ * cost_nvmestrom_scan
  */
 static void
-cost_ssdscan(Path *path,
-			 PlannerInfo *root,
-			 RelOptInfo *rel,
-			 ParamPathInfo *param_info)
+cost_nvmestrom_scan(Path *path,
+					PlannerInfo *root,
+					RelOptInfo *rel,
+					ParamPathInfo *param_info)
 {
 	Cost		startup_cost = 0;
 	Cost		cpu_run_cost;
 	Cost		disk_run_cost;
-	double		spc_seq_page_cost;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
+	Cost		startup_latency;
+	int			nblocks_per_chunk = (nvmestrom_chunk_size_kb << 10) / BLCKSZ;
 
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
@@ -275,20 +326,12 @@ cost_ssdscan(Path *path,
     else
 		path->rows = rel->rows;
 
-	/* fetch estimated page cost for tablespace containing table */
-	get_tablespace_page_costs(rel->reltablespace,
-							  NULL,
-							  &spc_seq_page_cost);
-
-
-
     /*
      * disk costs
      */
-    disk_run_cost = spc_seq_page_cost * rel->pages;
-	//needs to discount disk costs
-
-
+	disk_run_cost = nvmestrom_seq_page_cost * rel->pages;
+	startup_latency = nvmestrom_seq_page_cost * Min(nblocks_per_chunk,
+													rel->pages);
     /* CPU costs */
     get_restriction_qual_cost(root, rel, param_info, &qpqual_cost);
 
@@ -319,19 +362,19 @@ cost_ssdscan(Path *path,
 		 * the number of tuples processed per worker.
 		 */
 		path->rows = clamp_row_est(path->rows / parallel_divisor);
-    }
-    path->startup_cost = startup_cost;
+	}
+    path->startup_cost = startup_cost + startup_latency;
     path->total_cost = startup_cost + cpu_run_cost + disk_run_cost;
 }
 
 /*
- * create_ssdscan_path
+ * create_nvmestrom_scan_path
  */
 static CustomPath *
-create_ssdscan_path(PlannerInfo *root,
-					RelOptInfo *rel,
-					Relids required_outer,
-					int parallel_workers)
+create_nvmestrom_scan_path(PlannerInfo *root,
+						   RelOptInfo *rel,
+						   Relids required_outer,
+						   int parallel_workers)
 {
 	CustomPath	   *cpath = makeNode(CustomPath);
 
@@ -349,7 +392,7 @@ create_ssdscan_path(PlannerInfo *root,
 	cpath->custom_paths		= NIL;
 	cpath->custom_private	= NIL;
 	cpath->methods			= &nvmestrom_path_methods;
-	cost_ssdscan(&cpath->path, root, rel, cpath->path.param_info);
+	cost_nvmestrom_scan(&cpath->path, root, rel, cpath->path.param_info);
 
 	return cpath;
 }
@@ -366,15 +409,21 @@ nvmestrom_add_scan_path(PlannerInfo *root,
 	CustomPath	   *cpath;
 	Relids			required_outer = rel->lateral_relids;
 
+	if (set_rel_pathlist_next)
+		set_rel_pathlist_next(root, rel, rti, rte);
+
 	if (!nvmestrom_enabled)
 		return;
-	if (!tablespace_can_use_nvme_strom(rel->reltablespace, NULL))
+	if (rel->reloptkind != RELOPT_BASEREL)
 		return;
-	if (rel->pages < nvmestrom_nblocks_threshold)
+	if (!tablespace_can_use_nvme_strom(rel->reltablespace, NULL, true))
+		return;
+	if (nvmestrom_enabled > 0 &&	/* nvme_strom.enabled != always */
+		rel->pages < nvmestrom_nblocks_threshold)
 		return;
 
 	/* consider sequential ssd-scan */
-	cpath = create_ssdscan_path(root, rel, required_outer, 0);
+	cpath = create_nvmestrom_scan_path(root, rel, required_outer, 0);
 	add_path(rel, &cpath->path);
 
 	/* consider parallel ssd-scan */
@@ -384,10 +433,11 @@ nvmestrom_add_scan_path(PlannerInfo *root,
 
 		if (parallel_workers > 0)
 		{
-			cpath = create_ssdscan_path(root, rel,
-										required_outer,
-										parallel_workers);
+			cpath = create_nvmestrom_scan_path(root, rel,
+											   required_outer,
+											   parallel_workers);
 			add_partial_path(rel, &cpath->path);
+			generate_gather_paths(root, rel);
 		}
 	}
 }
@@ -435,8 +485,10 @@ PlanNVMEStromPath(PlannerInfo *root,
 static Node *
 CreateNVMEStromState(CustomScan *cscan)
 {
-	NVMEStromState *nss = palloc0(sizeof(NVMEStromState));
-
+	NVMEStromState *nss;
+	int				num_chunks = (nvmestrom_buffer_size_kb /
+								  nvmestrom_chunk_size_kb);
+	nss = palloc0(offsetof(NVMEStromState, dma_chunks[num_chunks]));
 	NodeSetTag(nss, T_CustomScanState);
 	nss->css.methods = &nvmestrom_exec_methods;
 
@@ -454,22 +506,22 @@ ExecInitNVMEStrom(CustomScanState *node,
 	NVMEStromState *nss = (NVMEStromState *) node;
 	Relation		relation = nss->css.ss.ss_currentRelation;
 
-	if (!relation_can_use_nvme_strom(relation, &nss->numa_node_id))
+	if (!relation_can_use_nvme_strom(relation, &nss->numa_node_id, false))
 		elog(ERROR, "Bug? unable to run NVMe-Strom on relation \"%s\"",
 			 RelationGetRelationName(relation));
 
-	nss->nsp_desc = NULL;	/* to be set later */
-
+	nss->nsp_desc = NULL;		/* to be set later */
+	nss->mmap_dma_buf = NULL;	/* to be mapped later */
+	nss->mdfd = NULL;			/* to be set later */
 	nss->chunk_sz = nvmestrom_chunk_size_kb << 10;
 	nss->num_chunks = nvmestrom_buffer_size_kb / nvmestrom_chunk_size_kb;
-	nss->chunk_bufs = NULL;		/* to be mapped later */
-	nss->curr_chunkid = -1;
+	nss->curr_dchunk = NULL;
 	nss->curr_bindex = -1;
 	nss->curr_lindex = -1;
 
 	nss->dma_rindex = 0;
 	nss->dma_windex = 0;
-	nss->num_dtasks = 0;
+	nss->free_chunks = nss->num_chunks;
 }
 
 
@@ -498,7 +550,7 @@ NVMEStromRememberDMABuffer(ResourceOwner owner,
 	tracker = MemoryContextAlloc(CacheMemoryContext,
 								 sizeof(dma_buffer_tracker));
 	INIT_LEGACY_CRC32(crc);
-	COMP_LEGACY_CRC32(crc, dma_buffer, sizeof(void *));
+	COMP_LEGACY_CRC32(crc, &dma_buffer, sizeof(void *));
 	FIN_LEGACY_CRC32(crc);
 	index = crc % DMABUFFER_TRACK_HASHSIZE;
 
@@ -521,7 +573,7 @@ NVMEStromForgetDMABuffer(void *dma_buffer)
 	dlist_iter	iter;
 
 	INIT_LEGACY_CRC32(crc);
-	COMP_LEGACY_CRC32(crc, dma_buffer, sizeof(void *));
+	COMP_LEGACY_CRC32(crc, &dma_buffer, sizeof(void *));
 	FIN_LEGACY_CRC32(crc);
 	index = crc % DMABUFFER_TRACK_HASHSIZE;
 
@@ -583,19 +635,50 @@ NVMEStromCleanupDMABuffer(ResourceReleasePhase phase,
 }
 
 /*
- * OpenNVMEStromControl - open ioctl file and map buffer
+ * ExecInitNVMEStromLater
+ *  -- initialization of exec-state on the first call of ExecProcNode().
  *
  * TODO: NUMA binding according to the storage location
  */
 static void
-OpenNVMEStromControl(NVMEStromState *nss)
+ExecInitNVMEStromLater(NVMEStromState *nss)
 {
 	StromCmd__AllocDMABuffer cmd;
-	int		dma_fdesc = -1;
-	char   *dma_buffer = NULL;
+	Relation	relation = nss->css.ss.ss_currentRelation;
+	EState	   *estate = nss->css.ss.ps.state;
+	BlockNumber	nr_blocks;
+	BlockNumber	nr_segs;
+	MdfdVec	   *vec;
+	char	   *dma_buffer = NULL;
+	int			i, dma_fdesc = -1;
 
-	if (nss->chunk_bufs != NULL)
+	if (nss->mmap_dma_buf != NULL)
 		elog(FATAL, "Bug? DMA buffer is already allocated");
+
+	/*
+	 * Setup quick lookup table of relation's file descriptor
+	 */
+	nr_blocks = RelationGetNumberOfBlocks(relation);
+	nr_segs = (nr_blocks + (BlockNumber) RELSEG_SIZE - 1) / RELSEG_SIZE;
+	nss->mdfd = MemoryContextAlloc(estate->es_query_cxt,
+								   sizeof(File) * nr_segs);
+	memset(nss->mdfd, -1, sizeof(File) * nr_segs);
+	vec = relation->rd_smgr->md_fd[MAIN_FORKNUM];
+	while (vec)
+	{
+		if (vec->mdfd_vfd < 0 ||
+			vec->mdfd_segno >= nr_segs)
+			elog(ERROR, "Bug? MdfdVec {vfd=%d segno=%u} is out of range",
+				 vec->mdfd_vfd, vec->mdfd_segno);
+		nss->mdfd[vec->mdfd_segno] = vec->mdfd_vfd;
+		vec = vec->mdfd_chain;
+	}
+	/* sanity checks */
+	for (i=0; i < nr_segs; i++)
+	{
+		if (nss->mdfd[i] < 0)
+			elog(ERROR, "Bug? there is a hole segment which was not open");
+	}
 
 	PG_TRY();
 	{
@@ -620,6 +703,14 @@ OpenNVMEStromControl(NVMEStromState *nss)
 		/* track dma_buffer for error handling */
 		NVMEStromRememberDMABuffer(CurrentResourceOwner,
 								   dma_buffer, cmd.length);
+		for (i=0; i < nss->num_chunks; i++)
+		{
+			NVMEStromDMAChunk  *dchunk = &nss->dma_chunks[i];
+
+			dchunk->chunk_buf = dma_buffer + (size_t)i * nss->chunk_sz;
+			dchunk->chunk_ids = palloc0(sizeof(uint32_t) *
+										(nss->chunk_sz / BLCKSZ));
+		}
 	}
 	PG_CATCH();
 	{
@@ -633,21 +724,7 @@ OpenNVMEStromControl(NVMEStromState *nss)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	nss->chunk_bufs = dma_buffer;
-}
-
-/*
- * CloseNVMEStromControl - close ioctl file and unmap buffer
- */
-static void
-CloseNVMEStromControl(NVMEStromState *nss)
-{
-	if (nss->chunk_bufs)
-	{
-		NVMEStromForgetDMABuffer(nss->chunk_bufs);
-		nss->chunk_bufs = NULL;
-	}
+	nss->mmap_dma_buf = dma_buffer;
 }
 
 /*
@@ -656,12 +733,96 @@ CloseNVMEStromControl(NVMEStromState *nss)
 static bool
 nvmestrom_next_chunk(NVMEStromState *nss)
 {
+	NVMEStromParallelDesc	   *nsp_desc = nss->nsp_desc;
+	NVMEStromDMAChunk		   *dchunk;
+	StromCmd__MemCopyWait		wait_cmd;
+	StromCmd__MemCopySsdToRam	load_cmd;
+	BlockNumber					block_pos;
+	unsigned int				i, num_blocks = nss->chunk_sz / BLCKSZ;
 
+	/* enqueue request until fill of dma chunks */
+	while (!nss->scan_done && nss->free_chunks > 0)
+	{
+		dchunk = &nss->dma_chunks[nss->dma_windex];
 
+		/* Identify the next range of blocks to read */
+		block_pos = pg_atomic_fetch_add_u64(&nsp_desc->nsp_cblock,
+											num_blocks);
+		if (block_pos >= nsp_desc->nsp_nblocks)
+		{
+			nss->scan_done = true;
+			return false;
+		}
+		if (block_pos + num_blocks > nsp_desc->nsp_nblocks)
+		{
+			num_blocks = nsp_desc->nsp_nblocks - block_pos;
+			nss->scan_done = true;
+		}
+		/* sanity checks */
+		Assert(num_blocks > 0);
+		Assert((block_pos / RELSEG_SIZE) ==
+			   (block_pos + num_blocks - 1) / RELSEG_SIZE);
 
+		/* Enqueue DMA command */
+		memset(&load_cmd, 0, offsetof(StromCmd__MemCopySsdToRam,
+									  dest_uaddr));
+		load_cmd.dest_uaddr = dchunk->chunk_buf;
+		load_cmd.file_desc = FileGetRawDesc(nss->mdfd[block_pos/RELSEG_SIZE]);
+		load_cmd.nr_chunks = num_blocks;
+		load_cmd.chunk_sz = BLCKSZ;
+		load_cmd.relseg_sz = RELSEG_SIZE;
+		for (i=0; i < num_blocks; i++)
+			dchunk->chunk_ids[i] = block_pos + i;
+		load_cmd.chunk_ids = dchunk->chunk_ids;
+		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2RAM, &load_cmd))
+			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_SSD2RAM) : %m");
+		dchunk->dma_task_id = load_cmd.dma_task_id;
+		dchunk->block_pos = block_pos;
+		dchunk->num_blocks = num_blocks;
+#if PG_VERSION_NUM >= 100000
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_ram2ram,
+								load_cmd.nr_ram2ram);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_ssd2ram,
+								load_cmd.nr_ssd2ram);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_submit,
+								load_cmd.nr_dma_submit);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_blocks,
+								load_cmd.nr_dma_blocks);
+#endif
+		/* Increment chunk usage */
+		nss->dma_windex = (nss->dma_windex + 1) % nss->num_chunks;
+		nss->free_chunks--;
+	}
 
+	/* Do we have any asynchronous tasks preliminary kicked? */
+	if (nss->free_chunks == nss->num_chunks)
+	{
+		Assert(nss->scan_done);
+		return false;
+	}
 
-	return false;
+	/* Wait for the next available chunk */
+	dchunk = &nss->dma_chunks[nss->dma_rindex];
+	wait_cmd.dma_task_id = dchunk->dma_task_id;
+	for (;;)
+	{
+		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &wait_cmd) == 0)
+			break;
+		else if (errno == EINTR)
+			CHECK_FOR_INTERRUPTS();
+		else
+			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_WAIT) : %m");
+	}
+	dchunk->dma_task_id = (unsigned long)(-1L);
+
+	/* release pinned chunk if any */
+	if (nss->curr_dchunk)
+		nss->free_chunks++;
+	nss->curr_dchunk = dchunk;
+	nss->curr_bindex = 0;
+	nss->curr_lindex = 0;
+
+	return true;
 }
 
 /*
@@ -670,7 +831,19 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 static TupleTableSlot *
 nvmestrom_next_tuple(NVMEStromState *nss)
 {
+	NVMEStromDMAChunk  *dchunk = nss->curr_dchunk;
 
+	for (;;)
+	{
+		
+
+
+
+
+
+	}
+
+	elog(INFO, "dchunk = %p block_pos=%u num_blocks=%u", dchunk, dchunk->block_pos, dchunk->num_blocks);
 
 	return NULL;
 }
@@ -684,30 +857,24 @@ ExecNVMEStromNext(CustomScanState *node)
 	NVMEStromState *nss = (NVMEStromState *) node;
 	TupleTableSlot *slot = NULL;
 
-	/* map DMA buffer on userspace */
-	if (!nss->chunk_bufs)
-		OpenNVMEStromControl(nss);
-	/* init private scan descriptor if not under Gatger node */
+	/* Init private scan descriptor if not under Gatger node */
 	if (!nss->nsp_desc)
 	{
 		Relation	relation = nss->css.ss.ss_currentRelation;
 
+		memset(&nss->__nsp_desc_private, 0, sizeof(NVMEStromParallelDesc));
 		nss->nsp_desc = &nss->__nsp_desc_private;
 		nss->nsp_desc->nsp_relid = RelationGetRelid(relation);
 		nss->nsp_desc->nsp_nblocks = RelationGetNumberOfBlocks(relation);
-		pg_atomic_init_u64(&nss->nsp_desc->nsp_cblock, 0);
 	}
+	/* Map DMA buffer on userspace */
+	if (!nss->mmap_dma_buf)
+		ExecInitNVMEStromLater(nss);
 
-	while (nss->curr_chunkid < 0 || !(slot = nvmestrom_next_tuple(nss)))
+	while (!nss->curr_dchunk || !(slot = nvmestrom_next_tuple(nss)))
 	{
-		/* push DMA request */
-		while (!nss->scan_done)
-		{
-			if (!nvmestrom_next_chunk(nss))
-				break;
-		}
-		// check status of completion
-		// if completed any, set curr_chunkid
+		if (!nvmestrom_next_chunk(nss))
+			break;
 	}
 	return slot;
 }
@@ -740,7 +907,11 @@ ExecEndNVMEStrom(CustomScanState *node)
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
 
-	CloseNVMEStromControl(nss);
+	if (nss->mmap_dma_buf)
+	{
+		NVMEStromForgetDMABuffer(nss->mmap_dma_buf);
+		nss->mmap_dma_buf = NULL;
+	}
 }
 
 /*
@@ -789,9 +960,9 @@ NVMEStromInitDSM(CustomScanState *node,
 
 	nsp_desc = shm_toc_allocate(pcxt->toc, nss->css.pscan_len);
 	/* init NVMEStromParallelDesc */
+	memset(nsp_desc, 0, sizeof(NVMEStromParallelDesc));
 	nsp_desc->nsp_relid = RelationGetRelid(relation);
 	nsp_desc->nsp_nblocks = RelationGetNumberOfBlocks(relation);
-	pg_atomic_init_u64(&nsp_desc->nsp_cblock, 0);
 	SerializeSnapshot(snapshot, nsp_desc->nsp_snapshot_data);
 	/* share with background workers */
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, nsp_desc);
@@ -856,11 +1027,12 @@ _PG_init(void)
 								   shared_buffer_size) / BLCKSZ;
 
 	/* nvme_strom.enabled */
-	DefineCustomBoolVariable("nvme_strom.enabled",
-							 "Enables/disables direct SSD scan by NVMe-Strom",
+	DefineCustomEnumVariable("nvme_strom.enabled",
+							 "enables/disabled direct SSD scan by NVMe-Strom",
 							 NULL,
 							 &nvmestrom_enabled,
-							 true,
+							 1,
+							 nvmestrom_enabled_options,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -886,6 +1058,20 @@ _PG_init(void)
 							PGC_USERSET,
 							GUC_NOT_IN_SAMPLE | GUC_UNIT_KB,
 							NULL, NULL, NULL);
+	//TODO: nvme_strom.buffer_size_limit ... default: 2GB
+
+	/* nvme_strom.seq_page_cost */
+	DefineCustomRealVariable("nvme_strom.seq_page_cost",
+							 "Sets the planner's estimate of the cost of "
+							 "a sequentially fetched disk page by NVMe-Strom",
+							 NULL,
+							 &nvmestrom_seq_page_cost,
+							 DEFAULT_SEQ_PAGE_COST / 4,
+							 0.0,
+							 DBL_MAX,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 	if (nvmestrom_chunk_size_kb % (BLCKSZ / 1024) != 0)
 		elog(ERROR, "nvme_strom.chunk_size must be multiple of BLCKSZ");
 	if (nvmestrom_buffer_size_kb % nvmestrom_chunk_size_kb != 0)
