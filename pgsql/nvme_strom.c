@@ -16,6 +16,7 @@
  * GNU General Public License for more details.
  */
 #include "postgres.h"
+#include "access/visibilitymap.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -26,7 +27,8 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/subselect.h"
-#include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
+#include "storage/predicate.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -133,12 +135,14 @@ typedef struct NVMEStromState {
 	NVMEStromDMAChunk *curr_dchunk;
 	int			curr_bindex;
 	int			curr_lindex;
+	HeapTupleData curr_tuple;
 
 	/* state of asynchronous scan with DMA */
 	bool		scan_done;		/* true, if already end of relation */
 	int			dma_rindex;		/* index to read next */
 	int			dma_windex;		/* index to write next */
 	int			free_chunks;	/* number of available chunks */
+	Buffer		vm_buffer;		/* buffer for visibility map */
 	NVMEStromDMAChunk dma_chunks[FLEXIBLE_ARRAY_MEMBER];
 } NVMEStromState;
 
@@ -414,7 +418,8 @@ nvmestrom_add_scan_path(PlannerInfo *root,
 
 	if (!nvmestrom_enabled)
 		return;
-	if (rel->reloptkind != RELOPT_BASEREL)
+	if (rel->reloptkind != RELOPT_BASEREL ||
+		rel->rtekind != RTE_RELATION)
 		return;
 	if (!tablespace_can_use_nvme_strom(rel->reltablespace, NULL, true))
 		return;
@@ -522,6 +527,7 @@ ExecInitNVMEStrom(CustomScanState *node,
 	nss->dma_rindex = 0;
 	nss->dma_windex = 0;
 	nss->free_chunks = nss->num_chunks;
+	nss->vm_buffer = InvalidBuffer;
 }
 
 
@@ -728,17 +734,139 @@ ExecInitNVMEStromLater(NVMEStromState *nss)
 }
 
 /*
+ * nvmestrom_load_chunk
+ */
+static void
+nvmestrom_load_chunk(NVMEStromState *nss,
+					 NVMEStromDMAChunk *dchunk)
+{
+	Relation		relation = nss->css.ss.ss_currentRelation;
+	SMgrRelation	smgr = relation->rd_smgr;
+	Snapshot		snapshot = nss->css.ss.ps.state->es_snapshot;
+	BlockNumber		block_pos = dchunk->block_pos;
+	unsigned int	num_blocks = dchunk->num_blocks;
+	int				i, j, k, l;
+
+	for (i=0, j=0, k=0; i < num_blocks; i++, block_pos++)
+	{
+		Buffer		buffer;
+		Page		spage;
+		Page		dpage;
+		bool		all_visible;
+
+		if (VM_ALL_VISIBLE(relation, block_pos, &nss->vm_buffer))
+		{
+			BufferTag	newTag;
+			uint32		newHash;
+			LWLock	   *newPartitionLock = NULL;
+			int			buf_id;
+
+			/* Does the source block exists on the shared buffer? */
+			INIT_BUFFERTAG(newTag, smgr->smgr_rnode.node,
+						   MAIN_FORKNUM, block_pos + i);
+			newHash = BufTableHashCode(&newTag);
+			newPartitionLock = BufMappingPartitionLock(newHash);
+
+			LWLockAcquire(newPartitionLock, LW_SHARED);
+			buf_id = BufTableLookup(&newTag, newHash);
+			LWLockRelease(newPartitionLock);
+			if (buf_id < 0)
+			{
+				/* ok, not cached and all-visible block */
+				dchunk->chunk_ids[j++] = block_pos;
+				continue;
+			}
+		}
+		/*
+		 * Elsewhere, block is cached or not all-visible
+		 */
+		l = num_blocks - (++k);
+		buffer = ReadBufferExtended(relation,
+									MAIN_FORKNUM,
+									block_pos,
+									RBM_NORMAL,
+									NULL);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		spage = (Page) BufferGetPage(buffer);
+		dpage = (Page) dchunk->chunk_buf + BLCKSZ * l;
+		memcpy(dpage, spage, BLCKSZ);
+
+		all_visible = (PageIsAllVisible(spage) &&
+					   !snapshot->takenDuringRecovery);
+		if (!all_visible)
+		{
+			int				lines = PageGetMaxOffsetNumber(dpage);
+			OffsetNumber	lineoff;
+			ItemId			lpp;
+
+			for (lineoff = FirstOffsetNumber, lpp = PageGetItemId(dpage,
+																  lineoff);
+				 lineoff <= lines;
+				 lineoff++, lpp++)
+			{
+				HeapTupleData	tup;
+				bool			valid;
+
+				if (!ItemIdIsNormal(lpp))
+					continue;
+
+				tup.t_tableOid = RelationGetRelid(relation);
+				tup.t_data = (HeapTupleHeader) PageGetItem((Page) dpage, lpp);
+				tup.t_len = ItemIdGetLength(lpp);
+				ItemPointerSet(&tup.t_self, block_pos, lineoff);
+
+				valid = HeapTupleSatisfiesVisibility(&tup, snapshot, buffer);
+				CheckForSerializableConflictOut(valid, relation, &tup,
+												buffer, snapshot);
+				if (!valid)
+					ItemIdSetUnused(lpp);
+			}
+		}
+		dchunk->chunk_ids[l] = block_pos;
+		UnlockReleaseBuffer(buffer);
+		PageSetAllVisible(dpage);
+	}
+	Assert(num_blocks == j + k);
+
+	if (j == 0)
+	{
+		/* no need to issue DMA requests */
+		dchunk->dma_task_id = ~0UL;
+	}
+	else
+	{
+		StromCmd__MemCopySsdToRam cmd;
+		File	vfd = nss->mdfd[dchunk->block_pos / RELSEG_SIZE];
+
+		memset(&cmd, 0, offsetof(StromCmd__MemCopySsdToRam, dest_uaddr));
+		cmd.dest_uaddr = dchunk->chunk_buf;
+		cmd.file_desc = FileGetRawDesc(vfd);
+		cmd.nr_chunks = j;
+		cmd.chunk_sz = BLCKSZ;
+		cmd.relseg_sz = RELSEG_SIZE;
+		cmd.chunk_ids = dchunk->chunk_ids;
+		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2RAM, &cmd))
+			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_SSD2RAM) : %m");
+		dchunk->dma_task_id = cmd.dma_task_id;
+#if PG_VERSION_NUM >= 100000
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_ram2ram, cmd.nr_ram2ram);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_ssd2ram, cmd.nr_ssd2ram);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_submit, cmd.nr_dma_submit);
+		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_blocks, cmd.nr_dma_blocks);
+#endif
+	}
+}
+
+/*
  * nvmestrom_next_chunk
  */
 static bool
 nvmestrom_next_chunk(NVMEStromState *nss)
 {
-	NVMEStromParallelDesc	   *nsp_desc = nss->nsp_desc;
-	NVMEStromDMAChunk		   *dchunk;
-	StromCmd__MemCopyWait		wait_cmd;
-	StromCmd__MemCopySsdToRam	load_cmd;
-	BlockNumber					block_pos;
-	unsigned int				i, num_blocks = nss->chunk_sz / BLCKSZ;
+	NVMEStromParallelDesc *nsp_desc = nss->nsp_desc;
+	NVMEStromDMAChunk *dchunk;
+	BlockNumber		block_pos;
+	unsigned int	num_blocks = nss->chunk_sz / BLCKSZ;
 
 	/* enqueue request until fill of dma chunks */
 	while (!nss->scan_done && nss->free_chunks > 0)
@@ -762,33 +890,10 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 		Assert(num_blocks > 0);
 		Assert((block_pos / RELSEG_SIZE) ==
 			   (block_pos + num_blocks - 1) / RELSEG_SIZE);
-
-		/* Enqueue DMA command */
-		memset(&load_cmd, 0, offsetof(StromCmd__MemCopySsdToRam,
-									  dest_uaddr));
-		load_cmd.dest_uaddr = dchunk->chunk_buf;
-		load_cmd.file_desc = FileGetRawDesc(nss->mdfd[block_pos/RELSEG_SIZE]);
-		load_cmd.nr_chunks = num_blocks;
-		load_cmd.chunk_sz = BLCKSZ;
-		load_cmd.relseg_sz = RELSEG_SIZE;
-		for (i=0; i < num_blocks; i++)
-			dchunk->chunk_ids[i] = block_pos + i;
-		load_cmd.chunk_ids = dchunk->chunk_ids;
-		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_SSD2RAM, &load_cmd))
-			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_SSD2RAM) : %m");
-		dchunk->dma_task_id = load_cmd.dma_task_id;
+		/* load a chunk with sync or async manner */
 		dchunk->block_pos = block_pos;
 		dchunk->num_blocks = num_blocks;
-#if PG_VERSION_NUM >= 100000
-		pg_atomic_fetch_add_u64(&nsp_desc->nr_ram2ram,
-								load_cmd.nr_ram2ram);
-		pg_atomic_fetch_add_u64(&nsp_desc->nr_ssd2ram,
-								load_cmd.nr_ssd2ram);
-		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_submit,
-								load_cmd.nr_dma_submit);
-		pg_atomic_fetch_add_u64(&nsp_desc->nr_dma_blocks,
-								load_cmd.nr_dma_blocks);
-#endif
+		nvmestrom_load_chunk(nss, dchunk);
 		/* Increment chunk usage */
 		nss->dma_windex = (nss->dma_windex + 1) % nss->num_chunks;
 		nss->free_chunks--;
@@ -803,17 +908,18 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 
 	/* Wait for the next available chunk */
 	dchunk = &nss->dma_chunks[nss->dma_rindex];
-	wait_cmd.dma_task_id = dchunk->dma_task_id;
-	for (;;)
+	while (dchunk->dma_task_id != ~0UL)
 	{
-		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &wait_cmd) == 0)
-			break;
+		StromCmd__MemCopyWait cmd;
+
+		cmd.dma_task_id = dchunk->dma_task_id;
+		if (nvme_strom_ioctl(STROM_IOCTL__MEMCPY_WAIT, &cmd) == 0)
+			dchunk->dma_task_id = ~0UL;
 		else if (errno == EINTR)
 			CHECK_FOR_INTERRUPTS();
 		else
 			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_WAIT) : %m");
 	}
-	dchunk->dma_task_id = (unsigned long)(-1L);
 
 	/* release pinned chunk if any */
 	if (nss->curr_dchunk)
@@ -831,20 +937,40 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 static TupleTableSlot *
 nvmestrom_next_tuple(NVMEStromState *nss)
 {
-	NVMEStromDMAChunk  *dchunk = nss->curr_dchunk;
+	NVMEStromDMAChunk *dchunk = nss->curr_dchunk;
+	Relation		relation = nss->css.ss.ss_currentRelation;
+	TupleTableSlot *slot = nss->css.ss.ss_ScanTupleSlot;
+	HeapTuple		tuple = &nss->curr_tuple;
+	BlockNumber		curr_blkid;
+	PageHeader		hpage;
+	unsigned int	max_lp_index;
 
-	for (;;)
+	while (nss->curr_bindex < dchunk->num_blocks)
 	{
-		
+		curr_blkid = dchunk->chunk_ids[nss->curr_bindex];
+		hpage = (PageHeader)(dchunk->chunk_buf + nss->curr_bindex * BLCKSZ);
+		max_lp_index = PageGetMaxOffsetNumber(hpage);
 
+		while (nss->curr_lindex <= max_lp_index)
+		{
+			int		lp_index = nss->curr_lindex++;
+			ItemId	lpp = &hpage->pd_linp[lp_index];
 
+			if (!ItemIdIsNormal(lpp))
+				continue;
+			Assert(PageIsAllVisible(hpage));
+			tuple->t_tableOid = RelationGetRelid(relation);
+			tuple->t_data = (HeapTupleHeader) PageGetItem(hpage, lpp);
+			tuple->t_len = ItemIdGetLength(lpp);
+			ItemPointerSet(&tuple->t_self, curr_blkid, lp_index);
 
+			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 
-
+			return slot;
+		}
+		nss->curr_bindex++;
+		nss->curr_lindex = 0;
 	}
-
-	elog(INFO, "dchunk = %p block_pos=%u num_blocks=%u", dchunk, dchunk->block_pos, dchunk->num_blocks);
-
 	return NULL;
 }
 
@@ -912,6 +1038,8 @@ ExecEndNVMEStrom(CustomScanState *node)
 		NVMEStromForgetDMABuffer(nss->mmap_dma_buf);
 		nss->mmap_dma_buf = NULL;
 	}
+	if (BufferIsValid(nss->vm_buffer))
+		ReleaseBuffer(nss->vm_buffer);
 }
 
 /*
