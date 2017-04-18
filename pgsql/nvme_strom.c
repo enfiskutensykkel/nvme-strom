@@ -130,11 +130,12 @@ typedef struct NVMEStromState {
 	/* reference to system resources */
 	void	   *mmap_dma_buf;	/* mapped DMA buffers */
 	File	   *mdfd;			/* quick lookup table of relation's fd */
+	Snapshot	worker_snapshot;/* snapshot that is registered */
 
 	/* state of relation scan */
 	NVMEStromDMAChunk *curr_dchunk;
 	int			curr_bindex;
-	int			curr_lindex;
+	int			curr_lineoff;
 	HeapTupleData curr_tuple;
 
 	/* state of asynchronous scan with DMA */
@@ -518,11 +519,12 @@ ExecInitNVMEStrom(CustomScanState *node,
 	nss->nsp_desc = NULL;		/* to be set later */
 	nss->mmap_dma_buf = NULL;	/* to be mapped later */
 	nss->mdfd = NULL;			/* to be set later */
+	nss->worker_snapshot = NULL;/* to be set on demand */
 	nss->chunk_sz = nvmestrom_chunk_size_kb << 10;
 	nss->num_chunks = nvmestrom_buffer_size_kb / nvmestrom_chunk_size_kb;
 	nss->curr_dchunk = NULL;
-	nss->curr_bindex = -1;
-	nss->curr_lindex = -1;
+	nss->curr_bindex = 0;
+	nss->curr_lineoff = FirstOffsetNumber;
 
 	nss->dma_rindex = 0;
 	nss->dma_windex = 0;
@@ -868,10 +870,17 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 	BlockNumber		block_pos;
 	unsigned int	num_blocks = nss->chunk_sz / BLCKSZ;
 
+	/* release the last chunk which is already read */
+	if (nss->curr_dchunk)
+	{
+		nss->curr_dchunk = NULL;
+		nss->free_chunks++;
+	}
+
 	/* enqueue request until fill of dma chunks */
 	while (!nss->scan_done && nss->free_chunks > 0)
 	{
-		dchunk = &nss->dma_chunks[nss->dma_windex];
+		dchunk = &nss->dma_chunks[nss->dma_windex % nss->num_chunks];
 
 		/* Identify the next range of blocks to read */
 		block_pos = pg_atomic_fetch_add_u64(&nsp_desc->nsp_cblock,
@@ -879,7 +888,7 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 		if (block_pos >= nsp_desc->nsp_nblocks)
 		{
 			nss->scan_done = true;
-			return false;
+			break;
 		}
 		if (block_pos + num_blocks > nsp_desc->nsp_nblocks)
 		{
@@ -895,19 +904,20 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 		dchunk->num_blocks = num_blocks;
 		nvmestrom_load_chunk(nss, dchunk);
 		/* Increment chunk usage */
-		nss->dma_windex = (nss->dma_windex + 1) % nss->num_chunks;
+		nss->dma_windex++;
 		nss->free_chunks--;
 	}
 
-	/* Do we have any asynchronous tasks preliminary kicked? */
-	if (nss->free_chunks == nss->num_chunks)
+	/* OK, we have no chunks to be returned any more */
+	if (nss->dma_windex == nss->dma_rindex)
 	{
 		Assert(nss->scan_done);
+		Assert(nss->free_chunks == nss->num_chunks);
 		return false;
 	}
 
 	/* Wait for the next available chunk */
-	dchunk = &nss->dma_chunks[nss->dma_rindex];
+	dchunk = &nss->dma_chunks[nss->dma_rindex++ % nss->num_chunks];
 	while (dchunk->dma_task_id != ~0UL)
 	{
 		StromCmd__MemCopyWait cmd;
@@ -920,13 +930,9 @@ nvmestrom_next_chunk(NVMEStromState *nss)
 		else
 			elog(ERROR, "failed on ioctl(STROM_IOCTL__MEMCPY_WAIT) : %m");
 	}
-
-	/* release pinned chunk if any */
-	if (nss->curr_dchunk)
-		nss->free_chunks++;
 	nss->curr_dchunk = dchunk;
 	nss->curr_bindex = 0;
-	nss->curr_lindex = 0;
+	nss->curr_lineoff = FirstOffsetNumber;
 
 	return true;
 }
@@ -943,18 +949,18 @@ nvmestrom_next_tuple(NVMEStromState *nss)
 	HeapTuple		tuple = &nss->curr_tuple;
 	BlockNumber		curr_blkid;
 	PageHeader		hpage;
-	unsigned int	max_lp_index;
+	int				lines;
 
 	while (nss->curr_bindex < dchunk->num_blocks)
 	{
 		curr_blkid = dchunk->chunk_ids[nss->curr_bindex];
 		hpage = (PageHeader)(dchunk->chunk_buf + nss->curr_bindex * BLCKSZ);
-		max_lp_index = PageGetMaxOffsetNumber(hpage);
+		lines = PageGetMaxOffsetNumber(hpage);
 
-		while (nss->curr_lindex <= max_lp_index)
+		while (nss->curr_lineoff <= lines)
 		{
-			int		lp_index = nss->curr_lindex++;
-			ItemId	lpp = &hpage->pd_linp[lp_index];
+			int		lineoff = nss->curr_lineoff++;
+			ItemId	lpp = PageGetItemId(hpage, lineoff);
 
 			if (!ItemIdIsNormal(lpp))
 				continue;
@@ -962,14 +968,14 @@ nvmestrom_next_tuple(NVMEStromState *nss)
 			tuple->t_tableOid = RelationGetRelid(relation);
 			tuple->t_data = (HeapTupleHeader) PageGetItem(hpage, lpp);
 			tuple->t_len = ItemIdGetLength(lpp);
-			ItemPointerSet(&tuple->t_self, curr_blkid, lp_index);
+			ItemPointerSet(&tuple->t_self, curr_blkid, lineoff);
 
 			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 
 			return slot;
 		}
 		nss->curr_bindex++;
-		nss->curr_lindex = 0;
+		nss->curr_lineoff = FirstOffsetNumber;
 	}
 	return NULL;
 }
@@ -1033,6 +1039,8 @@ ExecEndNVMEStrom(CustomScanState *node)
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
 
+	if (nss->worker_snapshot)
+		UnregisterSnapshot(nss->worker_snapshot);
 	if (nss->mmap_dma_buf)
 	{
 		NVMEStromForgetDMABuffer(nss->mmap_dma_buf);
@@ -1064,13 +1072,9 @@ ExecNVMEStromEstimateDSM(CustomScanState *node,
 {
 	EState	   *estate = node->ss.ps.state;
 
-	node->pscan_len = add_size(offsetof(NVMEStromParallelDesc,
-										nsp_snapshot_data),
-							   EstimateSnapshotSpace(estate->es_snapshot));
-	shm_toc_estimate_chunk(&pcxt->estimator, node->pscan_len);
-	shm_toc_estimate_keys(&pcxt->estimator, 1);
-
-	return 0;
+	return add_size(offsetof(NVMEStromParallelDesc,
+							 nsp_snapshot_data),
+					EstimateSnapshotSpace(estate->es_snapshot));
 }
 
 /*
@@ -1082,18 +1086,15 @@ NVMEStromInitDSM(CustomScanState *node,
 				 void *coordinate)
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
-	NVMEStromParallelDesc *nsp_desc;
+	NVMEStromParallelDesc *nsp_desc = coordinate;
 	Relation		relation = nss->css.ss.ss_currentRelation;
 	Snapshot		snapshot = nss->css.ss.ps.state->es_snapshot;
 
-	nsp_desc = shm_toc_allocate(pcxt->toc, nss->css.pscan_len);
 	/* init NVMEStromParallelDesc */
 	memset(nsp_desc, 0, sizeof(NVMEStromParallelDesc));
 	nsp_desc->nsp_relid = RelationGetRelid(relation);
 	nsp_desc->nsp_nblocks = RelationGetNumberOfBlocks(relation);
 	SerializeSnapshot(snapshot, nsp_desc->nsp_snapshot_data);
-	/* share with background workers */
-	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, nsp_desc);
 	nss->nsp_desc = nsp_desc;
 }
 
@@ -1106,16 +1107,15 @@ NVMEStromInitWorker(CustomScanState *node,
 					void *coordinate)
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
-	NVMEStromParallelDesc  *nsp_desc;
+	NVMEStromParallelDesc  *nsp_desc = coordinate;
 	Relation		relation = nss->css.ss.ss_currentRelation;
 	Snapshot		snapshot;
 
 	/* restore the snapshot */
-	nsp_desc = shm_toc_lookup(toc, node->ss.ps.plan->plan_node_id);
 	Assert(RelationGetRelid(relation) == nsp_desc->nsp_relid);
 	snapshot = RestoreSnapshot(nsp_desc->nsp_snapshot_data);
 	RegisterSnapshot(snapshot);
-
+	nss->worker_snapshot = snapshot;
 	nss->nsp_desc = nsp_desc;
 }
 
