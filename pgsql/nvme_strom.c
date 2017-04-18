@@ -39,6 +39,7 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "nvme_strom.h"
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -50,29 +51,18 @@ static set_rel_pathlist_hook_type set_rel_pathlist_next;
 static CustomPathMethods	nvmestrom_path_methods;
 static CustomScanMethods	nvmestrom_plan_methods;
 static CustomExecMethods	nvmestrom_exec_methods;
-static int					nvmestrom_enabled;			/* GUC */
+static bool					nvmestrom_enabled;			/* GUC */
 static int					nvmestrom_chunk_size_kb;	/* GUC */
 static int					nvmestrom_buffer_size_kb;	/* GUC */
 static double				nvmestrom_seq_page_cost;	/* GUC */
+static bool					nvmestrom_debug_no_threshold; /* GUC */
 static long					sysconf_pagesize;	/* _SC_PAGESIZE */
 static long					sysconf_phys_pages;	/* _SC_PHYS_PAGES */
 static long					nvmestrom_nblocks_threshold;
 static HTAB				   *vfs_nvme_htable = NULL;
 static Oid					nvme_last_tablespace_oid = InvalidOid;
 static bool					nvme_last_tablespace_supported;
-static int					nvme_last_numa_node_id = -1;
-
-/* options for nvme_strom.enabled */
-static struct config_enum_entry nvmestrom_enabled_options[] = {
-	{ "on",      1, false },
-	{ "off",     0, false },
-	{ "true",    1,  true },
-	{ "false",   0,  true },
-	{ "1",       1,  true },
-	{ "0",       0,  true },
-	{ "always", -1,  true },
-	{ NULL, 0, false }
-};
+static int					nvme_last_numa_node_id;
 
 /*
  * NVMEStromChunkBuffer
@@ -305,6 +295,89 @@ relation_can_use_nvme_strom(Relation relation,
 }
 
 /*
+ * bind_process_numa_node
+ */
+static void
+bind_process_numa_node(int numa_node_id)
+{
+	static int			last_node_id = -1;
+	static cpu_set_t	last_cpu_mask;
+	static char			last_numa_name[__CPU_SETSIZE + 80];
+
+	if (numa_node_id < 0)
+		return;		/* nothing to do */
+
+	/* setup cpumask if not constructed yet */
+	if (last_node_id != numa_node_id)
+	{
+		char	namebuf[256];
+		FILE   *filp;
+		int		i, ncpus = -1;
+		int		c, cpuid = -1;
+		int		ofs = 0;
+
+		snprintf(namebuf, sizeof(namebuf),
+				 "/sys/devices/system/node/node%d/cpulist", numa_node_id);
+		filp = fopen(namebuf, "rb");
+		if (!filp)
+		{
+			elog(WARNING, "failed on fopen(\"%s\") : %m", namebuf);
+			return;
+		}
+
+		CPU_ZERO(&last_cpu_mask);
+		do {
+			c = fgetc(filp);
+			if (isdigit(c))
+				cpuid = (cpuid >= 0 ? 10 * cpuid + (c - '0') : (c - '0'));
+			else if (c == ',' || c == '\n' || c == EOF)
+			{
+				ncpus = Max(cpuid, ncpus);
+				CPU_SET(cpuid, &last_cpu_mask);
+				cpuid = -1;
+			}
+			else
+			{
+				elog(WARNING, "unexpected character at %s (%c)", namebuf, c);
+				fclose(filp);
+				return;
+			}
+		} while (c != '\n' && c != EOF);
+		fclose(filp);
+
+		for (i = ncpus / __NCPUBITS; i >= 0; i--)
+		{
+			__cpu_mask	mask = last_cpu_mask.__bits[i];
+
+			ofs += snprintf(last_numa_name + ofs,
+							sizeof(last_numa_name) - ofs,
+							"%016lx%s", mask, i > 0 ? "," : "");
+		}
+		last_node_id = numa_node_id;
+	}
+	/* NUMA (un-)optimization */
+	if (sched_setaffinity(0, sizeof(cpu_set_t), &last_cpu_mask))
+		elog(WARNING, "failed on sched_setaffinity(2) : %m");
+	elog(DEBUG1, "pid=%u bind to numa node=%d (cpumap:%s)",
+		 MyProcPid, numa_node_id, last_numa_name);
+}
+
+/*
+ * unbind_process_numa_node
+ */
+static void
+unbind_process_numa_node(void)
+{
+	cpu_set_t	mask;
+
+	memset(&mask, -1, sizeof(mask));
+	if (sched_setaffinity(0, sizeof(mask), &mask))
+		elog(WARNING, "failed on sched_setaffinity(2) : %m");
+	elog(DEBUG1, "pid=%u got unbound from any particular numa node",
+		 MyProcPid);
+}
+
+/*
  * cost_nvmestrom_scan
  */
 static void
@@ -424,7 +497,7 @@ nvmestrom_add_scan_path(PlannerInfo *root,
 		return;
 	if (!tablespace_can_use_nvme_strom(rel->reltablespace, NULL, true))
 		return;
-	if (nvmestrom_enabled > 0 &&	/* nvme_strom.enabled != always */
+	if (!nvmestrom_debug_no_threshold &&
 		rel->pages < nvmestrom_nblocks_threshold)
 		return;
 
@@ -530,8 +603,20 @@ ExecInitNVMEStrom(CustomScanState *node,
 	nss->dma_windex = 0;
 	nss->free_chunks = nss->num_chunks;
 	nss->vm_buffer = InvalidBuffer;
-}
 
+	/*
+	 * Move the current process to closer NUMA node with storage, if any
+	 */
+	if (nss->numa_node_id > 0)
+	{
+		
+		
+		
+		
+		
+		
+	}
+}
 
 #define DMABUFFER_TRACK_HASHSIZE	23
 static dlist_head	dma_buffer_tracker_list[DMABUFFER_TRACK_HASHSIZE];
@@ -637,6 +722,8 @@ NVMEStromCleanupDMABuffer(ResourceReleasePhase phase,
 				if (munmap(tracker->dma_buffer, tracker->buffer_len))
 					elog(WARNING, "failed on munmap(2): %m");
 				pfree(tracker);
+				/* ensure process is not bound */
+				unbind_process_numa_node();
 			}
 		}
 	}
@@ -733,6 +820,9 @@ ExecInitNVMEStromLater(NVMEStromState *nss)
 	}
 	PG_END_TRY();
 	nss->mmap_dma_buf = dma_buffer;
+
+	/* NUMA bind, if available */
+	bind_process_numa_node(nss->numa_node_id);
 }
 
 /*
@@ -1039,6 +1129,7 @@ ExecEndNVMEStrom(CustomScanState *node)
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
 
+	unbind_process_numa_node();
 	if (nss->worker_snapshot)
 		UnregisterSnapshot(nss->worker_snapshot);
 	if (nss->mmap_dma_buf)
@@ -1155,12 +1246,11 @@ _PG_init(void)
 								   shared_buffer_size) / BLCKSZ;
 
 	/* nvme_strom.enabled */
-	DefineCustomEnumVariable("nvme_strom.enabled",
+	DefineCustomBoolVariable("nvme_strom.enabled",
 							 "enables/disabled direct SSD scan by NVMe-Strom",
 							 NULL,
 							 &nvmestrom_enabled,
-							 1,
-							 nvmestrom_enabled_options,
+							 true,
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
@@ -1200,6 +1290,17 @@ _PG_init(void)
 							 PGC_USERSET,
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
+
+	/* nvme_strom.debug_no_threshold */
+	DefineCustomBoolVariable("nvme_strom.debug_no_threshold",
+							 "[DEBUG] ignore table size threshold to invoke NVMe-Strom",
+							 NULL,
+							 &nvmestrom_debug_no_threshold,
+							 false,
+							 PGC_USERSET,
+                             GUC_NOT_IN_SAMPLE,
+                             NULL, NULL, NULL);
+
 	if (nvmestrom_chunk_size_kb % (BLCKSZ / 1024) != 0)
 		elog(ERROR, "nvme_strom.chunk_size must be multiple of BLCKSZ");
 	if (nvmestrom_buffer_size_kb % nvmestrom_chunk_size_kb != 0)
