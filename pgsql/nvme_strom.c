@@ -782,7 +782,7 @@ ExecInitNVMEStromLater(NVMEStromState *nss)
 		cmd.length = nss->chunk_sz * (size_t)nss->num_chunks;
 		cmd.node_id = -1;
 		if (nvme_strom_ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER, &cmd))
-			elog(ERROR, "failed on ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER)");
+			elog(ERROR, "failed on ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER) : %m");
 		dma_fdesc = cmd.dmabuf_fdesc;
 
 		/* map dma buffer */

@@ -116,6 +116,14 @@ atomic64_max_return(long newval, atomic64_t *atomic_ptr)
 #define prError(fmt, ...)						\
 	printk(KERN_ERR "nvme-strom: " fmt "\n", ##__VA_ARGS__)
 
+/*
+ * NOTE: It looks to us NVMe SSD does not accept DMA request larger than 128kB,
+ * according to the execution on Intel 750 SSD, however, we are also uncertain
+ * whether it is a common specification for all the NVMe-SSD device.
+ * Right now, we have 128kB as a default maximum unit size of DMA request.
+ */
+#define NVMESSD_DMAREQ_MAXSZ		(128 * 1024)
+
 /* routines for extra symbols */
 #include "extra_ksyms.c"
 
@@ -499,15 +507,6 @@ ioctl_check_file(StromCmd__CheckFile __user *uarg)
  *
  * ================================================================
  */
-
-/*
- * NOTE: It looks to us Intel 750 SSD does not accept DMA request larger
- * than 128KB. However, we are not certain whether it is restriction for
- * all the NVMe-SSD devices. Right now, 128KB is a default of the max unit
- * length of DMA request.
- */
-#define STROM_DMA_SSD2GPU_MAXLEN		(128 * 1024)
-
 struct nvme_ns;
 
 struct strom_dma_task
@@ -549,7 +548,7 @@ struct strom_dma_task
 	sector_t			head_sector;
 	unsigned int		nr_sectors;
 	/* temporary buffer for locked page cache in a chunk */
-	struct page		   *file_pages[STROM_DMA_SSD2GPU_MAXLEN / PAGE_CACHE_SIZE];
+	struct page		   *file_pages[NVMESSD_DMAREQ_MAXSZ / PAGE_CACHE_SIZE];
 };
 typedef struct strom_dma_task	strom_dma_task;
 
@@ -838,7 +837,7 @@ struct strom_prps_item
 	unsigned int		cpu_id;	/* index to strom_prps_locks/slots */
 	unsigned int		nrooms;	/* size of prps_list[] array */
 	unsigned int		nitems;	/* usage count of prps_list[] array */
-	__le64				prps_list[STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1];
+	__le64				prps_list[NVMESSD_DMAREQ_MAXSZ / PAGE_SIZE + 1];
 };
 typedef struct strom_prps_item		strom_prps_item;
 #define STROM_PRPS_ITEMS_NSLOTS		32
@@ -955,7 +954,7 @@ strom_prps_item_alloc(void)
 		memset(&pitem->chain, 0, sizeof(struct list_head));
 		pitem->pitem_dma = pitem_dma;
 		pitem->cpu_id = smp_processor_id();
-		pitem->nrooms = STROM_DMA_SSD2GPU_MAXLEN / PAGE_SIZE + 1;
+		pitem->nrooms = NVMESSD_DMAREQ_MAXSZ / PAGE_SIZE + 1;
 		pitem->nitems = 0;
 	}
 	return pitem;
@@ -1316,7 +1315,7 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 	struct nvme_ns *nvme_ns;
 	sector_t		sector;
 	unsigned int	nr_sects;
-	unsigned int	max_nr_sects = (STROM_DMA_SSD2GPU_MAXLEN >> SECTOR_SHIFT);
+	unsigned int	max_nr_sects = (NVMESSD_DMAREQ_MAXSZ >> SECTOR_SHIFT);
 	loff_t			curr_offset = dest_offset;
 	int				i, retval = 0;
 
@@ -1374,7 +1373,9 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 			dtask->head_sector + dtask->nr_sectors == sector &&
 			dtask->dest_offset +
 			SECTOR_SIZE * dtask->nr_sectors == curr_offset &&
-			(dest_segment_sz == 0 || (curr_offset % dest_segment_sz) > 0))
+			(dest_segment_sz == 0 ||
+			 ((curr_offset % dest_segment_sz) ==
+			  (curr_offset + PAGE_CACHE_SIZE - 1) % dest_segment_sz)))
 		{
 			dtask->nr_sectors += nr_sects;
 		}
@@ -1429,7 +1430,7 @@ submit_ssd2gpu_memcpy(strom_dma_task *dtask)
 	WARN_ON(nvme_page_size < PAGE_SIZE);
 
 	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
-	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
+	if (!total_nbytes || total_nbytes > NVMESSD_DMAREQ_MAXSZ)
 		return -EINVAL;
 	if (dtask->dest_offset < mgmem->map_offset ||
 		dtask->dest_offset + total_nbytes > (mgmem->map_offset +
@@ -1504,7 +1505,7 @@ do_memcpy_ssd2gpu(StromCmd__MemCopySsdToGpu *karg,
 	/* sanity checks */
 	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
 		karg->chunk_sz < PAGE_CACHE_SIZE ||					/* >= 4KB */
-		karg->chunk_sz > STROM_DMA_SSD2GPU_MAXLEN)			/* <= 128KB */
+		karg->chunk_sz > NVMESSD_DMAREQ_MAXSZ)				/* <= 128KB */
 		return -EINVAL;
 
 	dest_offset = mgmem->map_offset + karg->offset;
@@ -1707,7 +1708,7 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
 	WARN_ON((dtask->dest_offset & (PAGE_SIZE - 1)) != 0);
 
 	total_nbytes = SECTOR_SIZE * dtask->nr_sectors;
-	if (!total_nbytes || total_nbytes > STROM_DMA_SSD2GPU_MAXLEN)
+	if (!total_nbytes || total_nbytes > NVMESSD_DMAREQ_MAXSZ)
 		return -EINVAL;
 	if (dtask->dest_offset < 0 ||
 		dtask->dest_offset + total_nbytes > sd_buf->length)
@@ -1782,7 +1783,7 @@ do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 	/* sanity checks */
 	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
 		karg->chunk_sz < PAGE_CACHE_SIZE ||					/* >= 4KB */
-		karg->chunk_sz > STROM_DMA_SSD2GPU_MAXLEN ||		/* <= 128KB */
+		karg->chunk_sz > NVMESSD_DMAREQ_MAXSZ ||			/* <= 128KB */
 		(dest_offset & (PAGE_CACHE_SIZE - 1)) != 0)			/* alignment */
 		return -EINVAL;
 	if (dest_offset + ((size_t)karg->chunk_sz *
