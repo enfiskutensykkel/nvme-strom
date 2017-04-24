@@ -313,7 +313,7 @@ bind_process_numa_node(int numa_node_id)
 		char	namebuf[256];
 		FILE   *filp;
 		int		i, ncpus = -1;
-		int		c, cpuid = -1;
+		int		c, cpuid = -1, cpuid_prev = -1;
 		int		ofs = 0;
 
 		snprintf(namebuf, sizeof(namebuf),
@@ -333,7 +333,22 @@ bind_process_numa_node(int numa_node_id)
 			else if (c == ',' || c == '\n' || c == EOF)
 			{
 				ncpus = Max(cpuid, ncpus);
-				CPU_SET(cpuid, &last_cpu_mask);
+				if (cpuid_prev < 0)
+					CPU_SET(cpuid, &last_cpu_mask);
+				else
+				{
+					while (cpuid_prev <= cpuid)
+					{
+						CPU_SET(cpuid_prev, &last_cpu_mask);
+						cpuid_prev++;
+					}
+				}
+				cpuid = -1;
+				cpuid_prev = -1;
+			}
+			else if (c == '-')
+			{
+				cpuid_prev = cpuid;
 				cpuid = -1;
 			}
 			else

@@ -69,7 +69,8 @@ setup_cpu_affinity(int node_id)
 #define BITSPERINT		(8 * sizeof(int))
 	char		namebuf[256];
 	FILE	   *filp;
-	int			c, cpuid;
+	int			c, cpuid = -1;
+	int			cpuid_prev = -1;
 	cpu_set_t	mask;
 
 	/* nothing to do, if no numa binding */
@@ -82,7 +83,6 @@ setup_cpu_affinity(int node_id)
 	if (!filp)
 		ELOG(errno, "failed on fopen('%s')", namebuf);
 
-	cpuid = -1;
 	CPU_ZERO(&mask);
 	do {
 		c = fgetc(filp);
@@ -90,7 +90,22 @@ setup_cpu_affinity(int node_id)
 			cpuid = (cpuid >= 0 ? 10 * cpuid + (c - '0') : (c - '0'));
 		else if (c == ',' || c == '\n' || c == EOF)
 		{
-			CPU_SET(cpuid, &mask);
+			if (cpuid_prev < 0)
+				CPU_SET(cpuid, &mask);
+			else
+			{
+				while (cpuid_prev <= cpuid)
+				{
+					CPU_SET(cpuid_prev, &mask);
+					cpuid_prev++;
+				}
+			}
+			cpuid = -1;
+			cpuid_prev = -1;
+		}
+		else if (c == '-')
+		{
+			cpuid_prev = cpuid;
 			cpuid = -1;
 		}
 		else
