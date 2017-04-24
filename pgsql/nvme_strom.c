@@ -1214,7 +1214,8 @@ NVMEStromInitWorker(CustomScanState *node,
 {
 	NVMEStromState *nss = (NVMEStromState *) node;
 	NVMEStromParallelDesc  *nsp_desc = coordinate;
-	Relation		relation = nss->css.ss.ss_currentRelation;
+	Relation		relation	__attribute__ ((unused))
+		= nss->css.ss.ss_currentRelation;
 	Snapshot		snapshot;
 
 	/* restore the snapshot */
