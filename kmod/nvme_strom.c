@@ -1920,7 +1920,7 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCopySsdToRam __user *uarg,
 	 * and range is preliminary mapped to user application.
 	 */
 	down_read(&mm->mmap_sem);
-	dest_uaddr = (unsigned long)uarg->dest_uaddr;
+	dest_uaddr = (unsigned long)karg.dest_uaddr;
 	vma = find_vma(mm, dest_uaddr);
 	if (!vma || !vma->vm_file ||
 		vma->vm_file->f_op != &strom_dma_buffer_fops)
