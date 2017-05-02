@@ -1374,8 +1374,8 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 			dtask->dest_offset +
 			SECTOR_SIZE * dtask->nr_sectors == curr_offset &&
 			(dest_segment_sz == 0 ||
-			 ((curr_offset % dest_segment_sz) ==
-			  (curr_offset + PAGE_CACHE_SIZE - 1) % dest_segment_sz)))
+			 ((curr_offset / dest_segment_sz) ==
+			  (curr_offset + PAGE_CACHE_SIZE - 1) / dest_segment_sz)))
 		{
 			dtask->nr_sectors += nr_sects;
 		}
@@ -1797,9 +1797,7 @@ do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 		return -ERANGE;
 	}
 
-	dest_segment_sz = ((size_t)sd_buf->segment_sz *
-					   (size_t)PAGE_SIZE *
-					   (size_t)sd_buf->nr_segments);
+	dest_segment_sz = (size_t)sd_buf->segment_sz * (size_t)PAGE_SIZE;
 	i_size = i_size_read(f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
 	{
