@@ -18,13 +18,6 @@ KERNEL_RELEASE_NUM := $(shell echo $(KERNEL_VER)	\
 	| sed -e 's/\./ /g' -e 's/[A-Za-z].*$$//g'	\
 	| awk '{printf "%d", $$1}')
 
-CUDA_PATH_LIST := /usr/local/cuda /usr/local/cuda-*
-CUDA_PATH := $(shell for x in $(CUDA_PATH_LIST);    \
-	do test -e "$$x/include/cuda.h" && echo $$x; done | head -1)
-USERSPACE_FLAGS := -g -I $(CUDA_PATH)/include -L $(CUDA_PATH)/lib64
-
-EXTRA_CLEAN := nvme_test
-
 KMOD_SOURCE :=	nvme_strom.h nvme_strom.c extra_ksyms.c pmemmap.c \
 	rhel7_local.h \
 	$(shell cd $(M) && ls */md.h */raid0.h */nvme.h)
@@ -36,10 +29,7 @@ ccflags-y := -I.									\
 	-DKERNEL_VERSION_NUM=$(KERNEL_VERSION_NUM)		\
 	-DKERNEL_RELEASE_NUM=$(KERNEL_RELEASE_NUM)
 
-default: modules nvme_test
-
-nvme_test: nvme_test.c nvme_strom.h
-	$(CC) -Wall nvme_test.c -o $@ $(USERSPACE_FLAGS) -lcuda -lpthread
+default: modules
 
 # TODO:
 # Run 'dkms install $(NVME_STROM_PKGNAME)/$(NVME_STROM_VERSION)' here.
@@ -54,7 +44,6 @@ install-dkms:
 	install -m 0644 nvme_strom.modload.conf  /etc/modules-load.d/
 
 clean:
-	rm -f $(EXTRA_CLEAN)
 	$(MAKE) -C $(KERNEL_SOURCE) M=$(PWD) $@
 
 modules:
