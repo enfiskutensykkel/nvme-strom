@@ -444,6 +444,12 @@ cost_nvmestrom_scan(Path *path,
 		cpu_run_cost /= parallel_divisor;
 
 		/*
+		 * XXX - Just a workaround; we need more investigation how CPU
+		 * parallel performs with NVMe-Strom to improve scan throughput.
+		 */
+		disk_run_cost /= (Cost)(1 + Min(parallel_divisor, 4));
+
+		/*
 		 * It may be possible to amortize some of the I/O cost, but probably
 		 * not very much, because most operating systems already do aggressive
 		 * prefetching.  For now, we assume that the disk run cost can't be
