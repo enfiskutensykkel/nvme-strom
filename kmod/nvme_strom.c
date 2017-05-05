@@ -22,6 +22,7 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/hugetlb.h>
 #include <linux/idr.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
@@ -517,7 +518,7 @@ struct strom_dma_task
 	atomic_t			refcnt;		/* reference counter */
 	bool				frozen;		/* (DEBUG) no longer newly referenced */
 	mapped_gpu_memory  *mgmem;		/* destination GPU memory segment */
-	strom_dma_buffer   *sd_buf;		/* destination host mapped DMA buffer */
+	hugepage_dma_buffer *hd_buf;	/* destination huge-page buffer */
 	/* reference to the backing file */
 	struct file		   *filp;		/* source file */
 	/* MD RAID-0 configuration, if any */
@@ -574,7 +575,7 @@ strom_dma_task_index(unsigned long dma_task_id)
 static strom_dma_task *
 strom_create_dma_task(int fdesc,
 					  mapped_gpu_memory *mgmem,
-					  struct strom_dma_buffer *sd_buf,
+					  hugepage_dma_buffer *hd_buf,
 					  struct file *ioctl_filp)
 {
 	strom_dma_task		   *dtask;
@@ -588,8 +589,8 @@ strom_create_dma_task(int fdesc,
 	unsigned long			flags;
 
 	/* either of GPU or Host memory can be destination */
-	Assert((mgmem != NULL && sd_buf == NULL) ||
-		   (mgmem == NULL && sd_buf != NULL));
+	Assert((mgmem != NULL && hd_buf == NULL) ||
+		   (mgmem == NULL && hd_buf != NULL));
 
 	/* ensure the source file is supported */
 	filp = fget(fdesc);
@@ -623,7 +624,7 @@ strom_create_dma_task(int fdesc,
     atomic_set(&dtask->refcnt, 1);
 	dtask->frozen		= false;
     dtask->mgmem		= mgmem;
-	dtask->sd_buf		= sd_buf;
+	dtask->hd_buf		= hd_buf;
     dtask->filp			= filp;
 	dtask->mddev		= mddev;
 	dtask->nvme_ns		= NULL;		/* to be set later */
@@ -688,7 +689,7 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 	if (atomic_dec_and_test(&dtask->refcnt))
 	{
 		mapped_gpu_memory  *mgmem = dtask->mgmem;
-		strom_dma_buffer   *sd_buf = dtask->sd_buf;
+		hugepage_dma_buffer *hd_buf = dtask->hd_buf;
 		struct file		   *ioctl_filp = dtask->ioctl_filp;
 		struct file		   *data_filp = dtask->filp;
 		long				dma_status;
@@ -707,7 +708,7 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 			dtask->ioctl_filp = NULL;
 			dtask->filp = NULL;
 			dtask->mgmem = NULL;
-			dtask->sd_buf = NULL;
+			dtask->hd_buf = NULL;
 			list_add_tail_rcu(&dtask->chain, &failed_dma_task_slots[hindex]);
 		}
 		spin_unlock_irqrestore(&strom_dma_task_locks[hindex], flags);
@@ -719,8 +720,8 @@ strom_put_dma_task(strom_dma_task *dtask, long dma_status)
 			kfree(dtask);
 		if (mgmem)
 			strom_put_mapped_gpu_memory(mgmem);
-		if (sd_buf)
-			put_strom_dma_buffer(sd_buf);
+		if (hd_buf)
+			put_hugepage_dma_buffer(hd_buf);
 		fput(data_filp);
 		fput(ioctl_filp);
 
@@ -1306,7 +1307,7 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 					 loff_t fpos,
 					 int nr_pages,
 					 loff_t dest_offset,
-					 loff_t dest_segment_sz,
+					 int dest_segment_shift,
 					 int (*submit_async_memcpy)(strom_dma_task *),
 					 unsigned int *p_nr_dma_submit,
 					 unsigned int *p_nr_dma_blocks)
@@ -1373,9 +1374,9 @@ memcpy_from_nvme_ssd(strom_dma_task *dtask,
 			dtask->head_sector + dtask->nr_sectors == sector &&
 			dtask->dest_offset +
 			SECTOR_SIZE * dtask->nr_sectors == curr_offset &&
-			(dest_segment_sz == 0 ||
-			 ((curr_offset / dest_segment_sz) ==
-			  (curr_offset + PAGE_CACHE_SIZE - 1) / dest_segment_sz)))
+			(dest_segment_shift < 0 ||
+			 ((curr_offset >> dest_segment_shift) ==
+			  (curr_offset + PAGE_CACHE_SIZE - 1) >> dest_segment_shift)))
 		{
 			dtask->nr_sectors += nr_sects;
 		}
@@ -1562,7 +1563,7 @@ do_memcpy_ssd2gpu(StromCmd__MemCopySsdToGpu *karg,
 										  fpos,
 										  nr_pages,
 										  dest_offset,
-										  0,
+										  -1,
 										  submit_ssd2gpu_memcpy,
 										  &karg->nr_dma_submit,
 										  &karg->nr_dma_blocks);
@@ -1693,7 +1694,7 @@ out:
 static int
 submit_ssd2ram_memcpy(strom_dma_task *dtask)
 {
-	strom_dma_buffer   *sd_buf = dtask->sd_buf;
+	hugepage_dma_buffer *hd_buf = dtask->hd_buf;
 	struct nvme_ns	   *nvme_ns = dtask->nvme_ns;
 	struct nvme_ctrl   *nvme_ctrl = nvme_ns->ctrl;
 	struct page		   *ppage;
@@ -1711,7 +1712,7 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
 	if (!total_nbytes || total_nbytes > NVMESSD_DMAREQ_MAXSZ)
 		return -EINVAL;
 	if (dtask->dest_offset < 0 ||
-		dtask->dest_offset + total_nbytes > sd_buf->length)
+		dtask->dest_offset + total_nbytes > (hd_buf->nr_hpages << HPAGE_SHIFT))
 		return -ERANGE;
 
 	tv1 = rdtsc();
@@ -1726,12 +1727,12 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
 		size_t	len = Min(total_nbytes, nvme_ctrl->page_size);
 
 		Assert(i < pitem->nrooms);
-		j = (dest_offset >> PAGE_SHIFT) / sd_buf->segment_sz;
-		k = (dest_offset >> PAGE_SHIFT) % sd_buf->segment_sz;
-		ppage = sd_buf->dma_segments[j] + k;
-		pitem->prps_list[i] = page_to_phys(ppage);
+		j = dest_offset >> HPAGE_SHIFT;
+		k = dest_offset & (HPAGE_SIZE - 1);
+		ppage = hd_buf->hpages[j];
+		pitem->prps_list[i] = page_to_phys(ppage) + k;
 		dest_offset += len;
-		total_nbytes -= len;
+        total_nbytes -= len;
 	}
 	pitem->nitems = i;
 
@@ -1766,17 +1767,17 @@ submit_ssd2ram_memcpy(strom_dma_task *dtask)
 static int
 do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 				  strom_dma_task *dtask,
-				  size_t dest_offset, uint32_t *chunk_ids)
+				  uint32_t *chunk_ids)
 {
-	strom_dma_buffer   *sd_buf = dtask->sd_buf;
+	hugepage_dma_buffer *hd_buf = dtask->hd_buf;
 	struct file		   *filp = dtask->filp;
 	struct inode	   *f_inode = filp->f_inode;
 	struct super_block *i_sb = f_inode->i_sb;
+	unsigned long		dest_offset = hd_buf->uoffset;
 	char __user		   *dest_uaddr = karg->dest_uaddr;
 	unsigned int		nr_pages = (karg->chunk_sz >> PAGE_CACHE_SHIFT);
 	int					threshold = nr_pages / 2;
 	size_t				i_size;
-	size_t				dest_segment_sz;
 	long				i, j, k;
 	int					retval = 0;
 
@@ -1784,20 +1785,9 @@ do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 	if ((karg->chunk_sz & (PAGE_CACHE_SIZE - 1)) != 0 ||	/* alignment */
 		karg->chunk_sz < PAGE_CACHE_SIZE ||					/* >= 4KB */
 		karg->chunk_sz > NVMESSD_DMAREQ_MAXSZ ||			/* <= 128KB */
-		(dest_offset & (PAGE_CACHE_SIZE - 1)) != 0)			/* alignment */
+		(hd_buf->uoffset & (PAGE_CACHE_SIZE - 1)) != 0)		/* alignment */
 		return -EINVAL;
-	if (dest_offset + ((size_t)karg->chunk_sz *
-					   (size_t)karg->nr_chunks) > sd_buf->length)
-	{
-		prError("dest_offset=%lu-%lu buflen=%zu",
-				dest_offset,
-				dest_offset + ((size_t)karg->chunk_sz *
-							   (size_t)karg->nr_chunks),
-				sd_buf->length);
-		return -ERANGE;
-	}
 
-	dest_segment_sz = (size_t)sd_buf->segment_sz * (size_t)PAGE_SIZE;
 	i_size = i_size_read(f_inode);
 	for (i=0; i < karg->nr_chunks; i++)
 	{
@@ -1842,7 +1832,7 @@ do_memcpy_ssd2ram(StromCmd__MemCopySsdToRam *karg,
 										  fpos,
 										  nr_pages,
 										  dest_offset,
-										  dest_segment_sz,
+										  HPAGE_SHIFT,
 										  submit_ssd2ram_memcpy,
 										  &karg->nr_dma_submit,
 										  &karg->nr_dma_blocks);
@@ -1891,13 +1881,9 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCopySsdToRam __user *uarg,
 					 struct file *ioctl_filp)
 {
 	StromCmd__MemCopySsdToRam karg;
-	struct vm_area_struct  *vma = NULL;
-	struct mm_struct	   *mm = current->mm;
-	strom_dma_buffer	   *sd_buf;
+	hugepage_dma_buffer	   *hd_buf;
 	strom_dma_task		   *dtask;
 	uint32_t			   *chunk_ids;
-	unsigned long			dest_uaddr;
-	size_t					dest_offset;
 	int						retval = 0;
 
 	/* copy ioctl arguments from the userspace */
@@ -1913,41 +1899,20 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCopySsdToRam __user *uarg,
 		goto out;
 	}
 
-	/*
-	 * lookup destination buffer; which should be mapped DMA buffer
-	 * and range is preliminary mapped to user application.
-	 */
-	down_read(&mm->mmap_sem);
-	dest_uaddr = (unsigned long)karg.dest_uaddr;
-	vma = find_vma(mm, dest_uaddr);
-	if (!vma || !vma->vm_file ||
-		vma->vm_file->f_op != &strom_dma_buffer_fops)
+	/* lookup DMA destination buffer */
+	hd_buf = create_hugepage_dma_buffer(karg.dest_uaddr,
+										(size_t)karg.nr_chunks *
+										(size_t)karg.chunk_sz);
+	if (IS_ERR(hd_buf))
 	{
-		up_read(&mm->mmap_sem);
-		retval = -EINVAL;
+		retval = PTR_ERR(hd_buf);
 		goto out;
 	}
+	
 
-	if (dest_uaddr < vma->vm_start ||
-		dest_uaddr + ((size_t)karg.nr_chunks *
-					  (size_t)karg.chunk_sz) > vma->vm_end)
-	{
-		up_read(&mm->mmap_sem);
-		retval = -ERANGE;
-		prError("uaddr(%p-%p) vm(%p-%p)",
-				(void *)(dest_uaddr),
-				(void *)(dest_uaddr + (size_t)karg.nr_chunks * (size_t)karg.chunk_sz),
-				(void *)vma->vm_start,
-				(void *)vma->vm_end);
-		goto out;
-	}
-	dest_offset = vma->vm_pgoff * PAGE_SIZE + (dest_uaddr - vma->vm_start);
-	sd_buf = get_strom_dma_buffer(vma->vm_private_data);
-	up_read(&mm->mmap_sem);
-
-	/* setup DMA task with mapped host DMA buffer */
+	/* setup DMA task with huge-page DMA buffer */
 	dtask = strom_create_dma_task(karg.file_desc,
-								  NULL, sd_buf, ioctl_filp);
+								  NULL, hd_buf, ioctl_filp);
 	if (IS_ERR(dtask))
 	{
 		retval = PTR_ERR(dtask);
@@ -1957,7 +1922,7 @@ ioctl_memcpy_ssd2ram(StromCmd__MemCopySsdToRam __user *uarg,
 	karg.nr_ram2ram = 0;
 	karg.nr_ssd2ram = 0;
 
-	retval = do_memcpy_ssd2ram(&karg, dtask, dest_offset, chunk_ids);
+	retval = do_memcpy_ssd2ram(&karg, dtask, chunk_ids);
 	/* no more async task shall acquire the @dtask any more */
 	dtask->frozen = true;
 	barrier();
@@ -2120,7 +2085,7 @@ strom_proc_ioctl(struct file *ioctl_filp,
 			break;
 
 		case STROM_IOCTL__ALLOC_DMA_BUFFER:
-			retval = ioctl_alloc_dma_buffer((void __user *) arg);
+			retval = -ENOTSUPP;
 			break;
 
 		case STROM_IOCTL__MEMCPY_SSD2GPU:

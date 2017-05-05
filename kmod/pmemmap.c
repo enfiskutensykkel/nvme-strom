@@ -496,222 +496,151 @@ ioctl_info_gpu_memory(StromCmd__InfoGpuMemory __user *uarg)
 
 /* ================================================================
  *
- * Routines to manage NUMA aware DMA buffer
+ * Routines to manage host pinned huge-pages as DMA buffer
  *
- * NOTE: STROM_IOCTL__ALLOCATE_DMA_BUFFER makes an anonymous file handler
- * which allows application to mmap(2) preliminaty acquired NUMA aware DMA
- * buffer on user space. Then, application can kick asynchronous DMA call
- * onto the buffer.
- * ================================================================ */
-struct strom_dma_buffer
-{
-	size_t			length;		/* size required on allocation */
-	atomic_t		refcnt;		/* reference count */
-	int				node_id;	/* NUMA node id */
-	unsigned int	segment_sz;	/* # of pages per DMA segment */
-	unsigned int	nr_segments;/* # of DMA segments */
-	struct page	   *dma_segments[1];
-};
-typedef struct strom_dma_buffer		strom_dma_buffer;
-
-/*
- * get_strom_dma_buffer
+ * ================================================================
  */
-static strom_dma_buffer *
-get_strom_dma_buffer(strom_dma_buffer *sd_buf)
+struct hugepage_dma_buffer
+{
+	unsigned long	uoffset;	/* offset of userspace DMA buffer */
+	unsigned long	ulength;	/* length of userspace DMA buffer */
+	atomic_t		refcnt;
+	unsigned int	nr_hpages;
+	struct page	   *hpages[1];
+};
+typedef struct hugepage_dma_buffer	hugepage_dma_buffer;
+
+/* see arch/x86/mm/hugetlbpage.c */
+static inline int __pud_huge(pud_t pud)
+{
+	return !!(pud_val(pud) & _PAGE_PSE);
+}
+
+/* mm/hugetlb.c */
+static inline pte_t *
+__huge_pte_offset(struct mm_struct *mm, unsigned long addr)
+{
+	pgd_t	   *pgd;
+	pud_t	   *pud;
+	pmd_t	   *pmd = NULL;
+
+	pgd = pgd_offset(mm, addr);
+	if (pgd_present(*pgd)) {
+		pud = pud_offset(pgd, addr);
+		if (pud_present(*pud)) {
+			if (__pud_huge(*pud))
+				return (pte_t *)pud;
+			pmd = pmd_offset(pud, addr);
+		}
+	}
+	return (pte_t *) pmd;
+}
+
+static hugepage_dma_buffer *
+create_hugepage_dma_buffer(void __user *__uaddr, size_t ulength)
+{
+	struct mm_struct       *mm = current->mm;
+	struct vm_area_struct  *vma;
+	struct page			   *page;
+	hugepage_dma_buffer	   *hd_buf;
+	unsigned long			uaddr = (unsigned long)__uaddr;
+	unsigned long			ustart, uend;
+	unsigned long			curr;
+	unsigned int			i, nr_hpages;
+
+	/*
+	 * Lookup DMA destination buffer; which should be huge-pages,
+	 * and memory-locked not to be released under the asynchronous
+	 * transfer.
+	 */
+	down_read(&mm->mmap_sem);
+	vma = find_vma(mm, uaddr);
+	if (!vma ||
+		uaddr < vma->vm_start ||
+		uaddr + ulength > vma->vm_end)
+	{
+		up_read(&mm->mmap_sem);
+		return ERR_PTR(-ERANGE);
+	}
+
+	if ((vma->vm_flags & VM_HUGETLB)   == 0 ||
+		(vma->vm_flags & VM_LOCKED)    == 0 ||
+		(vma->vm_flags & VM_NORESERVE) != 0)
+	{
+		up_read(&mm->mmap_sem);
+		prError("uaddr(%p-%p) vma(%p-%p) is not huge-pages/locked-memory",
+				(void *)(uaddr),
+				(void *)(uaddr + ulength),
+				(void *)(vma->vm_start),
+				(void *)(vma->vm_end));
+		return ERR_PTR(-EINVAL);
+	}
+	ustart = uaddr & HPAGE_MASK;
+	uend = (uaddr + ulength + HPAGE_SIZE - 1) & HPAGE_MASK;
+	nr_hpages = (uend - ustart) / HPAGE_SIZE;
+
+	hd_buf = kzalloc(offsetof(hugepage_dma_buffer,
+							  hpages[nr_hpages]), GFP_KERNEL);
+	if (!hd_buf)
+	{
+		up_read(&mm->mmap_sem);
+		return ERR_PTR(-ENOMEM);
+	}
+	Assert(uaddr >= ustart && (uaddr - ustart) < HPAGE_SIZE);
+	hd_buf->uoffset = (uaddr - ustart);
+	hd_buf->ulength = ulength;
+	atomic_set(&hd_buf->refcnt, 1);
+	hd_buf->nr_hpages = nr_hpages;
+
+	/* see follow_huge_addr */
+	for (i=0, curr = ustart; i < nr_hpages; i++, curr += HPAGE_SIZE)
+	{
+		pte_t  *pte = __huge_pte_offset(mm, curr);
+
+		/* hugetlb should be locked, and hence, prefaulted */
+		if (!pte || pte_none(*pte))
+			goto page_not_found;
+
+		page = pte_page(*pte);
+		WARN_ON(!PageHead(page));
+
+		get_page(page);
+		hd_buf->hpages[i] = page;
+	}
+	up_read(&mm->mmap_sem);
+	return hd_buf;
+
+page_not_found:
+	while (i > 0)
+		put_page(hd_buf->hpages[--i]);
+	kfree(hd_buf);
+	up_read(&mm->mmap_sem);
+	return ERR_PTR(-EINVAL);
+}
+
+static void
+drop_hugepage_dma_buffer(hugepage_dma_buffer *hd_buf)
+{
+	int		i;
+
+	for (i=0; i < hd_buf->nr_hpages; i++)
+		put_page(hd_buf->hpages[i]);
+	kfree(hd_buf);
+}
+
+static inline hugepage_dma_buffer *
+get_hugepage_dma_buffer(hugepage_dma_buffer *hd_buf)
 {
 	int		refcnt		__attribute__((unused));
 
-	refcnt = atomic_inc_return(&sd_buf->refcnt);
+	refcnt = atomic_inc_return(&hd_buf->refcnt);
 	Assert(refcnt > 1);
-	return sd_buf;
+	return hd_buf;
 }
 
-/*
- * put_strom_dma_buffer
- */
-static void
-put_strom_dma_buffer(strom_dma_buffer *sd_buf)
+static inline void
+put_hugepage_dma_buffer(hugepage_dma_buffer *hd_buf)
 {
-	if (atomic_dec_and_test(&sd_buf->refcnt))
-	{
-		int		i, j;
-
-		for (i=0; i < sd_buf->nr_segments; i++)
-		{
-			for (j=0; j < sd_buf->segment_sz; j++)
-				__free_page(sd_buf->dma_segments[i] + j);
-		}
-		kfree(sd_buf);
-	}
-}
-
-/*
- * strom_dma_buffer_fault - fault handler of DMA buffer
- */
-static int
-strom_dma_buffer_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
-{
-	strom_dma_buffer *sd_buf = vma->vm_private_data;
-	struct page	   *dma_page;
-	unsigned int	index;
-	unsigned int	offset;
-
-	if (!sd_buf)
-		return VM_FAULT_NOPAGE;
-	index  = vmf->pgoff / sd_buf->segment_sz;
-	offset = vmf->pgoff % sd_buf->segment_sz;
-	if (index >= sd_buf->nr_segments)
-		return VM_FAULT_SIGBUS;
-
-	dma_page = sd_buf->dma_segments[index] + offset;
-	get_page(dma_page);
-	vmf->page = dma_page;
-
-	return 0;
-}
-
-static const struct vm_operations_struct strom_dma_buffer_vm_ops = {
-	.fault		= strom_dma_buffer_fault,
-};
-
-static int
-strom_dma_buffer_mmap(struct file *filp, struct vm_area_struct *vma)
-{
-	strom_dma_buffer   *sd_buf = filp->private_data;
-	unsigned long		vm_len = vma->vm_end - vma->vm_start;
-
-	/* sanity checks */
-	WARN_ON(vma->vm_file != filp);
-	/* available only if MAP_SHARED */
-	if ((vma->vm_flags & (VM_SHARED|VM_MAYSHARE)) == 0)
-	{
-		prError("Only MAP_SHARED is available on mmap(2) to Strom DMA Buffer");
-		return -EINVAL;
-	}
-	/* range must be contained in the physical DMA buffer pages */
-	if ((vma->vm_pgoff << PAGE_SHIFT) + vm_len > sd_buf->length)
-	{
-		prError("vma (%p-%p on (%zu...%zu) is out of range (size=%zu)",
-				(void *)vma->vm_start,
-				(void *)vma->vm_end - 1,
-				(size_t)(vma->vm_pgoff << PAGE_SHIFT),
-				(size_t)(vm_len),
-				(size_t)(sd_buf->length));
-		return -EINVAL;
-	}
-	vma->vm_flags |= VM_IO;
-	vma->vm_ops = &strom_dma_buffer_vm_ops;
-	vma->vm_private_data = sd_buf;
-	return 0;
-}
-
-static int
-strom_dma_buffer_release(struct inode *inode, struct file *filp)
-{
-	put_strom_dma_buffer((strom_dma_buffer *) filp->private_data);
-
-	return 0;
-}
-
-static const struct file_operations strom_dma_buffer_fops = {
-	.mmap		= strom_dma_buffer_mmap,
-	.release	= strom_dma_buffer_release,
-};
-
-/*
- * STROM_IOCTL__ALLOCATE_DMA_BUFFER
- */
-static int
-ioctl_alloc_dma_buffer(StromCmd__AllocDMABuffer __user *uarg)
-{
-	StromCmd__AllocDMABuffer karg;
-	strom_dma_buffer *sd_buf;
-	unsigned int	order = (MAX_ORDER - 1);
-	unsigned int	segment_sz = (1U << order);
-	unsigned int	i, j, nr_segments;
-	char			namebuf[80];
-	int				fdesc = -ENOMEM;
-
-	if (copy_from_user(&karg, uarg, sizeof(StromCmd__AllocDMABuffer)))
-		return -EFAULT;
-
-	/* sanity checks */
-	if (karg.length < PAGE_SIZE || (karg.length & (PAGE_SIZE - 1)) != 0)
-	{
-		prError("DMA buffer length is 0 or unaligned (len=%zu)",
-				(size_t)karg.length);
-		return -EINVAL;
-	}
-	if (karg.node_id >= 0 && karg.node_id >= nr_node_ids)
-	{
-		prError("Numa node ID is out of range (node_id=%d)", karg.node_id);
-		return -EINVAL;
-	}
-
-	/* allocate DMA buffer from normal zone */
-	nr_segments = (karg.length + (segment_sz << PAGE_SHIFT) - 1)
-							   / (segment_sz << PAGE_SHIFT);
-	sd_buf = kzalloc(offsetof(strom_dma_buffer,
-							  dma_segments[nr_segments]), GFP_KERNEL);
-	if (!sd_buf)
-		return -ENOMEM;
-
-	sd_buf->length  = karg.length;
-	atomic_set(&sd_buf->refcnt, 1);
-	sd_buf->node_id = karg.node_id;
-	sd_buf->segment_sz = segment_sz;
-	sd_buf->nr_segments = nr_segments;
-	for (i=0; i < nr_segments; i++)
-	{
-		struct page *dma_segment = alloc_pages_node(sd_buf->node_id,
-													GFP_KERNEL,
-													order);
-		if (!dma_segment)
-			goto error;
-		split_page(dma_segment, order);
-		sd_buf->dma_segments[i] = dma_segment;
-	}
-
-	/* construction of an anonymous file */
-	if (karg.length < (8UL << 20))
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuKB",
-				 sd_buf->node_id, (size_t)(karg.length >> 10));
-	else if (karg.length < (8UL << 30))
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuMB",
-				 sd_buf->node_id, (size_t)(karg.length >> 20));
-	else
-		snprintf(namebuf, sizeof(namebuf), "dmabuf%u:%zuGB",
-				 sd_buf->node_id, (size_t)(karg.length >> 30));
-	fdesc = anon_inode_getfd(namebuf,
-							 &strom_dma_buffer_fops,
-							 sd_buf, O_RDWR);
-	if (fdesc < 0)
-		goto error;
-	karg.dmabuf_fdesc = fdesc;
-
-	/* back to the userspace */
-	if (copy_to_user(uarg, &karg, sizeof(StromCmd__AllocDMABuffer)))
-	{
-		struct file *filp = fcheck(fdesc);
-
-		put_unused_fd(fdesc);
-		if (filp)
-			fput(filp);
-		fdesc = -EFAULT;
-		goto error;
-	}
-	return 0;
-
-error:
-	prError("failed on ioctl_alloc_dma_buffer (%d)", fdesc);
-	for (i=0; i < sd_buf->nr_segments; i++)
-	{
-		if (!sd_buf->dma_segments[i])
-			break;
-		for (j=0; j < sd_buf->segment_sz; j++)
-			__free_page(sd_buf->dma_segments[i] + j);
-	}
-	kfree(sd_buf);
-	return fdesc;
+	if (atomic_dec_and_test(&hd_buf->refcnt))
+		drop_hugepage_dma_buffer(hd_buf);
 }
