@@ -549,9 +549,9 @@ create_hugepage_dma_buffer(void __user *__uaddr, size_t ulength)
 	unsigned int			i, nr_hpages;
 
 	/*
-	 * Lookup DMA destination buffer; which should be huge-pages,
-	 * and memory-locked not to be released under the asynchronous
-	 * transfer.
+	 * Lookup DMA destination buffer; which should be huge-pages.
+	 * We can also assume huge-pages are prefault and locked unless
+	 * VM_NORESERVE is not supplied explicitly.
 	 */
 	down_read(&mm->mmap_sem);
 	vma = find_vma(mm, uaddr);
@@ -563,12 +563,11 @@ create_hugepage_dma_buffer(void __user *__uaddr, size_t ulength)
 		return ERR_PTR(-ERANGE);
 	}
 
-	if ((vma->vm_flags & VM_HUGETLB)   == 0 ||
-		(vma->vm_flags & VM_LOCKED)    == 0 ||
+	if (!is_vm_hugetlb_page(vma) ||
 		(vma->vm_flags & VM_NORESERVE) != 0)
 	{
 		up_read(&mm->mmap_sem);
-		prError("uaddr(%p-%p) vma(%p-%p) is not huge-pages/locked-memory",
+		prError("uaddr(0x%p-0x%p) in vma(0x%p-0x%p) is not DMA buffer",
 				(void *)(uaddr),
 				(void *)(uaddr + ulength),
 				(void *)(vma->vm_start),

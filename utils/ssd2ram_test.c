@@ -118,30 +118,20 @@ setup_cpu_affinity(int node_id)
 	fclose(filp);
 }
 
-
-
-
-
-
 static void *
 alloc_dma_buffer(int node_id)
 {
-	StromCmd__AllocDMABuffer cmd;
 	void	   *buffer;
-
-	memset(&cmd, 0, sizeof(StromCmd__AllocDMABuffer));
-	cmd.length = buffer_size;
-	cmd.node_id = node_id;
-
-	if (nvme_strom_ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER, &cmd))
-		ELOG(errno, "failed on ioctl(STROM_IOCTL__ALLOC_DMA_BUFFER)");
 
 	buffer = mmap(NULL, buffer_size,
 				  PROT_READ | PROT_WRITE,
-				  MAP_SHARED,
-				  cmd.dmabuf_fdesc, 0);
+				  MAP_PRIVATE |
+				  MAP_ANONYMOUS |
+				  MAP_HUGETLB |
+				  MAP_POPULATE,
+				  -1, 0);
 	if (buffer == MAP_FAILED)
-		ELOG(errno, "failed on mmap(2) with DMA buffer FD");
+		ELOG(errno, "failed on mmap(2): %m");
 	printf("mmap(2) = %p\n", buffer);
 	return buffer;
 }
